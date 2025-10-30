@@ -32,7 +32,7 @@ from sgl_mindspore.layers import (
     VocabParallelEmbedding,
     YaRNScalingRotaryEmbedding,
 )
-from sgl_mindspore.mindspore_model_base import MindSporeModelBase
+from sgl_mindspore.models.mindspore_model_base import MindSporeModelBase
 from sgl_mindspore.utils import _get_tp_group_name, tensor_torch2ms
 
 logger = logging.getLogger(__name__)

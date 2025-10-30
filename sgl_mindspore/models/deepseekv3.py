@@ -27,7 +27,7 @@ from sgl_mindspore.layers import (
     VocabParallelEmbedding,
     yarn_get_mscale,
 )
-from sgl_mindspore.mindspore_model_base import MindSporeModelBase
+from sgl_mindspore.models.mindspore_model_base import MindSporeModelBase
 from sgl_mindspore.utils import (
     _get_tp_group_name,
     set_weight_attrs,
