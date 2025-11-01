@@ -12,7 +12,6 @@ import mindspore.ops.operations as P
 import numpy as np
 import torch
 from mindspore import Parameter, Tensor, dtype, jit, mint, mutable, nn, ops
-
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -20,6 +19,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.utils import divide
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+
 from sgl_mindspore.layers import (
     BaseRotaryEmbedding,
     ColParallelLinear,
@@ -41,7 +41,9 @@ Qwen3Config = None
 
 
 class Qwen3MLP(nn.Cell):
-    def __init__(self, config) -> None:
+    def __init__(
+        self, config, quant_config: Optional[QuantizationConfig] = None
+    ) -> None:
         super().__init__(config)
 
         self.hidden_size = config.hidden_size
@@ -54,12 +56,14 @@ class Qwen3MLP(nn.Cell):
             param_dtype=self.param_dtype,
             bias=False,
             output_sizes=[self.intermediate_size] * 2,
+            quant_config=quant_config,
         )
         self.down_proj = RowParallelLinear(
             input_size=config.intermediate_size,
             output_size=config.hidden_size,
             param_dtype=config.param_dtype,
             bias=False,
+            quant_config=quant_config,
         )
         self.act_fn = SwiGLU()
 
@@ -71,7 +75,9 @@ class Qwen3MLP(nn.Cell):
 
 
 class Qwen3Attention(nn.Cell):
-    def __init__(self, config) -> None:
+    def __init__(
+        self, config, quant_config: Optional[QuantizationConfig] = None
+    ) -> None:
         super().__init__()
 
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -110,6 +116,7 @@ class Qwen3Attention(nn.Cell):
             total_num_kv_heads=self.num_kv_heads,
             bias=config.attention_bias,
             param_dtype=self.param_dtype,
+            quant_config=quant_config,
         )
         self.q_norm = RMSNorm(
             norm_dim=config.head_dim,
@@ -126,6 +133,7 @@ class Qwen3Attention(nn.Cell):
             output_size=self.hidden_size,
             param_dtype=self.param_dtype,
             bias=config.attention_bias,
+            quant_config=quant_config,
         )
         self.rotary_emb = None
         if self.rope_type == "yarn":
@@ -217,13 +225,15 @@ class Qwen3Attention(nn.Cell):
 
 
 class Qwen3DecoderLayer(nn.Cell):
-    def __init__(self, config) -> None:
+    def __init__(
+        self, config, quant_config: Optional[QuantizationConfig] = None
+    ) -> None:
         super().__init__()
 
         self.hidden_size = config.hidden_size
 
-        self.self_attn = Qwen3Attention(config=config)
-        self.mlp = Qwen3MLP(config=config)
+        self.self_attn = Qwen3Attention(config=config, quant_config=quant_config)
+        self.mlp = Qwen3MLP(config=config, quant_config=quant_config)
         self.input_layernorm = RMSNorm(
             norm_dim=config.hidden_size,
             eps=config.rms_norm_eps,
@@ -279,7 +289,7 @@ class Qwen3Model(nn.Cell):
     qwen3 model
     """
 
-    def __init__(self, config):
+    def __init__(self, config, quant_config: Optional[QuantizationConfig] = None):
         super().__init__()
         self.config = config
 
@@ -292,7 +302,7 @@ class Qwen3Model(nn.Cell):
         self.layers = nn.CellList()
 
         for i in range(self.num_hidden_layers):
-            layer = Qwen3DecoderLayer(config=config)
+            layer = Qwen3DecoderLayer(config=config, quant_config=quant_config)
             self.layers.append(layer)
 
         self.norm = RMSNorm(
@@ -370,7 +380,7 @@ class Qwen3ForCausalLM(MindSporeModelBase):
 
         self.config = config
         setattr(self.config, "param_dtype", dtype.bfloat16)
-        self.model = Qwen3Model(self.config)
+        self.model = Qwen3Model(self.config, quant_config=quant_config)
 
         self.lm_head = ColParallelLinear(
             input_size=self.config.hidden_size,
@@ -499,5 +509,6 @@ class Qwen3ForCausalLM(MindSporeModelBase):
             logits = self.all_gather(logits)
         logits = mint.reshape(logits, (-1, logits.shape[-1]))
         return logits
+
 
 EntryClass = Qwen3ForCausalLM
