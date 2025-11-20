@@ -5,7 +5,6 @@ import torch
 import torch_npu
 from mindspore.utils.dlpack import from_dlpack as ms_from_dlpack
 from mindspore.utils.dlpack import to_dlpack as ms_to_dlpack
-
 from sglang.srt.distributed import get_tp_group, get_world_group
 
 

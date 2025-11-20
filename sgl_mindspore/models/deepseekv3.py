@@ -8,11 +8,11 @@ from typing import Iterable, List, Optional, Tuple
 import mindspore.common.dtype as mstype
 import torch
 from mindspore import Parameter, Tensor, dtype, jit, mint, mutable, nn, ops
-
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.distributed.utils import divide
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+
 from sgl_mindspore.layers import (
     BaseRotaryEmbedding,
     ColParallelLinear,
@@ -28,11 +28,7 @@ from sgl_mindspore.layers import (
     yarn_get_mscale,
 )
 from sgl_mindspore.models.mindspore_model_base import MindSporeModelBase
-from sgl_mindspore.utils import (
-    _get_tp_group_name,
-    set_weight_attrs,
-    tensor_torch2ms,
-)
+from sgl_mindspore.utils import _get_tp_group_name, set_weight_attrs, tensor_torch2ms
 
 
 def transpose_rope_weight(weight, start_dim):
@@ -820,5 +816,6 @@ class DeepseekV3ForCausalLM(MindSporeModelBase):
         logits = ops.cast(logits, dtype.float32)
         logits = mint.reshape(logits, (-1, logits.shape[-1]))
         return logits
+
 
 EntryClass = DeepseekV3ForCausalLM
