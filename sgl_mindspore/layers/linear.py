@@ -39,7 +39,9 @@ class LinearBase(nn.Cell):
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
         else:
-            self.quant_method = quant_config.get_quant_method(self)
+            self.quant_method = quant_config.get_quant_method(
+                self, prefix=self.param_prefix
+            )
 
     def construct(self, input: Tensor) -> Tuple[Tensor, bool]:
         raise NotImplementedError()
@@ -149,13 +151,15 @@ class QKVParallelLinear(ColParallelLinear):
     def weight_load(
         self, param: Parameter, weight: torch.Tensor, shard_id: Optional[str] = None
     ) -> None:
+        if param.size == 1:
+            param.set_data(tensor_torch2ms(weight))
+            return None
+
         copy_dim = 0
         tp_rank = get_tensor_model_parallel_rank()
 
-        param_data = param.data
         shard_offset, shard_size = self.get_shard_offset_and_size(shard_id=shard_id)
 
-        param_data = param_data.narrow(copy_dim, shard_offset, shard_size)
         if shard_id == "q":
             shard_idx = tp_rank
         else:
@@ -163,16 +167,15 @@ class QKVParallelLinear(ColParallelLinear):
         start_idx = shard_idx * shard_size
 
         weight = weight.narrow(copy_dim, start_idx, shard_size).contiguous()
-        assert param_data.shape == weight.shape
-        del param_data
-        if param.name.endswith("weight"):
-            self.weight[shard_offset : shard_offset + shard_size, :] = tensor_torch2ms(
-                weight
-            )
-        if param.name.endswith("bias"):
-            self.bias[shard_offset : shard_offset + shard_size] = tensor_torch2ms(
-                weight
-            )
+        param[shard_offset : shard_offset + shard_size, ...] = tensor_torch2ms(weight)
+        # if param.name.endswith(".weight"):
+        #     self.weight[shard_offset : shard_offset + shard_size, :] = tensor_torch2ms(
+        #         weight
+        #     )
+        # if param.name.endswith(".bias"):
+        #     self.bias[shard_offset : shard_offset + shard_size] = tensor_torch2ms(
+        #         weight
+        #     )
 
 
 class MLPColParallelLinear(ColParallelLinear):
@@ -205,6 +208,10 @@ class MLPColParallelLinear(ColParallelLinear):
         return -1
 
     def weight_load(self, param: Tensor, weight: torch.Tensor, shard_id: str) -> None:
+        if param.shape[0] == 1:
+            param.set_data(tensor_torch2ms(weight))
+            return None
+
         shard_idx = self._get_shard_idx(shard_id=shard_id)
         assert shard_idx != -1
 
@@ -221,7 +228,9 @@ class MLPColParallelLinear(ColParallelLinear):
             start_idx = tp_rank * shard_size
             weight = weight.narrow(copy_dim, start_idx, shard_size).contiguous()
             assert param_data.shape == weight.shape
-            param[shard_offset : shard_offset + shard_size, :] = tensor_torch2ms(weight)
+            param[shard_offset : shard_offset + shard_size, ...] = tensor_torch2ms(
+                weight
+            )
 
 
 class RowParallelLinear(LinearBase):
@@ -266,6 +275,7 @@ class RowParallelLinear(LinearBase):
             self.bias = Parameter(mint.zeros(self.output_size, dtype=self.param_dtype))
             setattr(self.bias, "weight_load", self.weight_load)
         tp_group_name = _get_tp_group_name()
+        self.tp_rank = get_tensor_model_parallel_rank()
         self.all_reduce = ops.AllReduce(group=tp_group_name)
 
     def construct(self, input: Tensor) -> Tuple[Tensor, bool]:
@@ -276,11 +286,11 @@ class RowParallelLinear(LinearBase):
         return x
 
     def weight_load(self, param: Tensor, weight: torch.Tensor) -> None:
-        tp_rank = get_tensor_model_parallel_rank()
-        copy_dim = 1
-        shard_size = param.shape[copy_dim]
-        start_idx = tp_rank * shard_size
-        weight = weight.narrow(copy_dim, start_idx, shard_size).contiguous()
+        if weight.dim() > 1 and weight.shape[1] > 1:
+            copy_dim = 1
+            shard_size = param.shape[copy_dim]
+            start_idx = self.tp_rank * shard_size
+            weight = weight.narrow(copy_dim, start_idx, shard_size).contiguous()
 
         param.set_data(tensor_torch2ms(weight))
         return None
