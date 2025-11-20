@@ -13,11 +13,11 @@ from mindspore.ops.auto_generate import (
     MoeInitRoutingV2,
     MoeTokenUnpermute,
 )
-
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+
 from sgl_mindspore.utils import (
     _get_tp_group_name,
     _get_world_group_name,

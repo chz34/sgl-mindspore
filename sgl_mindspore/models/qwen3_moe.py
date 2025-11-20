@@ -12,7 +12,6 @@ import mindspore.ops.operations as P
 import numpy as np
 import torch
 from mindspore import Parameter, Tensor, dtype, jit, mint, mutable, nn, ops
-
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -20,6 +19,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.utils import divide
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+
 from sgl_mindspore.layers import (
     BaseRotaryEmbedding,
     ColParallelLinear,
@@ -599,5 +599,6 @@ class Qwen3MoeForCausalLM(MindSporeModelBase):
         logits = ops.cast(logits, dtype.float32)
         logits = mint.reshape(logits, (-1, logits.shape[-1]))
         return logits
+
 
 EntryClass = Qwen3MoeForCausalLM

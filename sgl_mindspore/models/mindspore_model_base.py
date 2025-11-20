@@ -4,7 +4,6 @@ from abc import abstractmethod
 from typing import Any, Dict, Optional
 
 import mindspore as ms
-
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 

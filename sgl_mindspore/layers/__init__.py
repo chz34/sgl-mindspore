@@ -17,6 +17,4 @@ from sgl_mindspore.layers.rope import (
     YaRNScalingRotaryEmbedding,
     yarn_get_mscale,
 )
-from sgl_mindspore.layers.vocab_embedding import (
-    VocabParallelEmbedding,
-)
+from sgl_mindspore.layers.vocab_embedding import VocabParallelEmbedding
