@@ -59,3 +59,23 @@ def set_weight_attrs(weight, weight_attrs):
         return
     for key, value in weight_attrs.items():
         setattr(weight, key, value)
+
+
+def get_ms_dtype(dtype: torch.dtype):
+    type_name = str(dtype).split(".")[-1]
+    if hasattr(ms.dtype, type_name):
+        return getattr(ms.dtype, type_name)
+    raise ValueError(f"MindSpore dtype {type_name} is not supported.")
+
+
+def add_prefix(name: str, prefix: str) -> str:
+    """Add a weight path prefix to a module name.
+
+    Args:
+        name: base module name.
+        prefix: weight prefix str to added to the front of `name` concatenated with `.`.
+
+    Returns:
+        The string `prefix.name` if prefix is non-empty, otherwise just `name`.
+    """
+    return name if not prefix else f"{prefix}.{name}"

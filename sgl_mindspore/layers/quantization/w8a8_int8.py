@@ -22,10 +22,28 @@ class MsW8A8Int8Config(W8A8Int8Config):
     ) -> Optional[QuantizeMethodBase]:
         from sgl_mindspore.layers.linear import LinearBase
 
-        if layer.input_size == 12288 and layer.output_size == 4096:
-            return UnquantizedLinearMethod()
-
         if isinstance(layer, LinearBase):
+            key = "model"
+            if "vision_model" in prefix:
+                key = "vision_model"
+            elif "visual" in prefix:
+                key = "visual"
+            packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
+            prefix_in_quant_config = prefix
+            proj_name = prefix.split(".")[-1]
+            if proj_name in packed_modules_mapping_subset:
+                prefix_in_quant_config = prefix.replace(
+                    proj_name, packed_modules_mapping_subset[proj_name][0]
+                )
+            self.is_dynamic = (
+                self.quant_description[prefix_in_quant_config + ".weight"]
+                == "W8A8_DYNAMIC"
+            )
+            assert (
+                not self.is_dynamic
+            ), "Dynamic quantization is not supported in Mindspore models yet."
+            if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
+                return UnquantizedLinearMethod()
             return MSW8A8LinearMethod(self)
         return None
 

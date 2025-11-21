@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
 import logging
+from os import pread
 from typing import Iterable, Optional, Tuple, Type, Union
 
 import mindspore as ms
@@ -29,6 +30,7 @@ class LinearBase(nn.Cell):
         bias: bool = True,
         param_dtype: Optional[ms.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.input_size = input_size
@@ -39,9 +41,7 @@ class LinearBase(nn.Cell):
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
         else:
-            self.quant_method = quant_config.get_quant_method(
-                self, prefix=self.param_prefix
-            )
+            self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
 
     def construct(self, input: Tensor) -> Tuple[Tensor, bool]:
         raise NotImplementedError()
@@ -55,8 +55,16 @@ class ColParallelLinear(LinearBase):
         bias: bool,
         param_dtype: Optional[ms.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
-        super().__init__(input_size, output_size, bias, param_dtype, quant_config)
+        super().__init__(
+            input_size=input_size,
+            output_size=output_size,
+            bias=bias,
+            param_dtype=param_dtype,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
 
         self.tp_size = get_tensor_model_parallel_world_size()
         self.param_dtype = param_dtype
@@ -106,6 +114,7 @@ class QKVParallelLinear(ColParallelLinear):
         bias: bool = True,
         param_dtype: Optional[Type] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         self.hidden_size = hidden_size
         self.head_dim = head_dim
@@ -133,6 +142,7 @@ class QKVParallelLinear(ColParallelLinear):
             bias=bias,
             param_dtype=param_dtype,
             quant_config=quant_config,
+            prefix=prefix,
         )
 
     def get_shard_offset_and_size(self, shard_id: str):
@@ -187,6 +197,7 @@ class MLPColParallelLinear(ColParallelLinear):
         output_sizes: list,
         param_dtype: Optional[Type] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__(
             input_size=input_size,
@@ -194,6 +205,7 @@ class MLPColParallelLinear(ColParallelLinear):
             param_dtype=param_dtype,
             bias=bias,
             quant_config=quant_config,
+            prefix=prefix,
         )
 
         self.output_sizes = output_sizes
@@ -242,6 +254,7 @@ class RowParallelLinear(LinearBase):
         param_dtype: Optional[Type] = None,
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
+        prefix: str = "",
     ) -> None:
         super().__init__(
             input_size=input_size,
@@ -249,6 +262,7 @@ class RowParallelLinear(LinearBase):
             bias=bias,
             param_dtype=param_dtype,
             quant_config=quant_config,
+            prefix=prefix,
         )
 
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -306,6 +320,7 @@ class MoeReplicatedLinear(nn.Cell):
         optim_tp_ep_gating_perf: bool = False,
         expert_start_index: Optional[Type] = None,
         expert_end_index: Optional[Type] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 

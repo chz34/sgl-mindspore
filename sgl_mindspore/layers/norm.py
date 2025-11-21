@@ -7,7 +7,9 @@ from mindspore.ops.auto_generate import add_rms_norm, rms_norm
 
 
 class RMSNorm(nn.Cell):
-    def __init__(self, norm_dim: int, eps: float, param_dtype: Optional[Type]) -> None:
+    def __init__(
+        self, norm_dim: int, eps: float, param_dtype: Optional[Type], prefix: str = ""
+    ) -> None:
         super().__init__()
 
         self.weight = Parameter(mint.ones(norm_dim, dtype=param_dtype))
