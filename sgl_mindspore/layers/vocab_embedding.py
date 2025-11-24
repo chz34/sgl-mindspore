@@ -22,7 +22,10 @@ from sgl_mindspore.utils import _get_tp_group_name, tensor_torch2ms
 
 class VocabParallelEmbedding(nn.Cell):
     def __init__(
-        self, config: Any, quant_config: Optional[QuantizationConfig] = None
+        self,
+        config: Any,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -44,7 +47,7 @@ class VocabParallelEmbedding(nn.Cell):
 
         quant_method = None
         if quant_config is not None:
-            quant_method = quant_config.get_quant_method(self)
+            quant_method = quant_config.get_quant_method(self, prefix)
         if quant_method is None:
             quant_method = UnquantizedEmbeddingMethod()
 

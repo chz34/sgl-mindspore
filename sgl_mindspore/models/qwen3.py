@@ -32,8 +32,14 @@ from sgl_mindspore.layers import (
     VocabParallelEmbedding,
     YaRNScalingRotaryEmbedding,
 )
+from sgl_mindspore.layers.quantization.base_config import get_ms_quant_config
 from sgl_mindspore.models.mindspore_model_base import MindSporeModelBase
-from sgl_mindspore.utils import _get_tp_group_name, tensor_torch2ms
+from sgl_mindspore.utils import (
+    _get_tp_group_name,
+    add_prefix,
+    get_ms_dtype,
+    tensor_torch2ms,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +48,10 @@ Qwen3Config = None
 
 class Qwen3MLP(nn.Cell):
     def __init__(
-        self, config, quant_config: Optional[QuantizationConfig] = None
+        self,
+        config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__(config)
 
@@ -57,6 +66,7 @@ class Qwen3MLP(nn.Cell):
             bias=False,
             output_sizes=[self.intermediate_size] * 2,
             quant_config=quant_config,
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             input_size=config.intermediate_size,
@@ -64,6 +74,7 @@ class Qwen3MLP(nn.Cell):
             param_dtype=config.param_dtype,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("down_proj", prefix),
         )
         self.act_fn = SwiGLU()
 
@@ -76,7 +87,10 @@ class Qwen3MLP(nn.Cell):
 
 class Qwen3Attention(nn.Cell):
     def __init__(
-        self, config, quant_config: Optional[QuantizationConfig] = None
+        self,
+        config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -117,16 +131,19 @@ class Qwen3Attention(nn.Cell):
             bias=config.attention_bias,
             param_dtype=self.param_dtype,
             quant_config=quant_config,
+            prefix=add_prefix("qkv_proj", prefix),
         )
         self.q_norm = RMSNorm(
             norm_dim=config.head_dim,
             eps=config.rms_norm_eps,
             param_dtype=config.param_dtype,
+            prefix=add_prefix("q_norm", prefix),
         )
         self.k_norm = RMSNorm(
             norm_dim=config.head_dim,
             eps=config.rms_norm_eps,
             param_dtype=config.param_dtype,
+            prefix=add_prefix("k_norm", prefix),
         )
         self.o_proj = RowParallelLinear(
             input_size=self.q_size,
@@ -134,6 +151,7 @@ class Qwen3Attention(nn.Cell):
             param_dtype=self.param_dtype,
             bias=config.attention_bias,
             quant_config=quant_config,
+            prefix=add_prefix("o_proj", prefix),
         )
         self.rotary_emb = None
         if self.rope_type == "yarn":
@@ -226,23 +244,34 @@ class Qwen3Attention(nn.Cell):
 
 class Qwen3DecoderLayer(nn.Cell):
     def __init__(
-        self, config, quant_config: Optional[QuantizationConfig] = None
+        self,
+        config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
         self.hidden_size = config.hidden_size
 
-        self.self_attn = Qwen3Attention(config=config, quant_config=quant_config)
-        self.mlp = Qwen3MLP(config=config, quant_config=quant_config)
+        self.self_attn = Qwen3Attention(
+            config=config,
+            quant_config=quant_config,
+            prefix=add_prefix("self_attn", prefix),
+        )
+        self.mlp = Qwen3MLP(
+            config=config, quant_config=quant_config, prefix=add_prefix("mlp", prefix)
+        )
         self.input_layernorm = RMSNorm(
             norm_dim=config.hidden_size,
             eps=config.rms_norm_eps,
             param_dtype=config.param_dtype,
+            prefix=add_prefix("input_layernorm", prefix),
         )
         self.post_attention_layernorm = RMSNorm(
             norm_dim=config.hidden_size,
             eps=config.rms_norm_eps,
             param_dtype=config.param_dtype,
+            prefix=add_prefix("post_attention_layernorm", prefix),
         )
 
     def construct(
@@ -289,7 +318,12 @@ class Qwen3Model(nn.Cell):
     qwen3 model
     """
 
-    def __init__(self, config, quant_config: Optional[QuantizationConfig] = None):
+    def __init__(
+        self,
+        config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.config = config
 
@@ -297,18 +331,25 @@ class Qwen3Model(nn.Cell):
         self.hidden_size = config.hidden_size
         self.num_hidden_layers = config.num_hidden_layers
 
-        self.embed_tokens = VocabParallelEmbedding(config=config)
+        self.embed_tokens = VocabParallelEmbedding(
+            config=config, prefix=add_prefix("embed_tokens", prefix)
+        )
 
         self.layers = nn.CellList()
 
         for i in range(self.num_hidden_layers):
-            layer = Qwen3DecoderLayer(config=config, quant_config=quant_config)
+            layer = Qwen3DecoderLayer(
+                config=config,
+                quant_config=quant_config,
+                prefix=add_prefix(f"layers.{i}", prefix),
+            )
             self.layers.append(layer)
 
         self.norm = RMSNorm(
             norm_dim=config.hidden_size,
             eps=config.rms_norm_eps,
             param_dtype=config.param_dtype,
+            prefix=add_prefix("norm", prefix),
         )
 
     # pylint: disable=W0613
@@ -377,16 +418,23 @@ class Qwen3ForCausalLM(MindSporeModelBase):
     ) -> None:
         super().__init__()
         self.prev_prefill = False
-
         self.config = config
-        setattr(self.config, "param_dtype", dtype.bfloat16)
-        self.model = Qwen3Model(self.config, quant_config=quant_config)
+        quant_config = get_ms_quant_config(quant_config)
+        if self.config.dtype:
+            param_dtype = get_ms_dtype(self.config.dtype)
+        else:
+            param_dtype = ms.dtype.bfloat16
+        setattr(self.config, "param_dtype", param_dtype)
+        self.model = Qwen3Model(
+            self.config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
 
         self.lm_head = ColParallelLinear(
             input_size=self.config.hidden_size,
             output_size=self.config.vocab_size,
             param_dtype=self.config.param_dtype,
             bias=False,
+            prefix=add_prefix("lm_head", prefix),
         )
         self.tp_size = get_tensor_model_parallel_world_size()
         self.all_gather = GatherLastDim()

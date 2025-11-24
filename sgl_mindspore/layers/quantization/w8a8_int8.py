@@ -1,0 +1,161 @@
+from typing import List, Optional
+
+import mindspore as ms
+from mindspore.ops.operations._infer_ops import QuantV2
+from sglang.srt.layers.quantization.base_config import LinearMethodBase
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+
+from sgl_mindspore.layers.linear import RowParallelLinear
+from sgl_mindspore.layers.quantization.base_config import QuantizeMethodBase
+from sgl_mindspore.layers.quantization.unquant import UnquantizedLinearMethod
+from sgl_mindspore.utils import set_weight_attrs
+
+
+class MsW8A8Int8Config(W8A8Int8Config):
+    def __init__(self, quant_config: W8A8Int8Config):
+        super().__init__(quant_config.quant_description)
+
+    def get_quant_method(
+        self,
+        layer: ms.nn.Cell,
+        prefix: str,
+    ) -> Optional[QuantizeMethodBase]:
+        from sgl_mindspore.layers.linear import LinearBase
+
+        if isinstance(layer, LinearBase):
+            key = "model"
+            if "vision_model" in prefix:
+                key = "vision_model"
+            elif "visual" in prefix:
+                key = "visual"
+            packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
+            prefix_in_quant_config = prefix
+            proj_name = prefix.split(".")[-1]
+            if proj_name in packed_modules_mapping_subset:
+                prefix_in_quant_config = prefix.replace(
+                    proj_name, packed_modules_mapping_subset[proj_name][0]
+                )
+            self.is_dynamic = (
+                self.quant_description[prefix_in_quant_config + ".weight"]
+                == "W8A8_DYNAMIC"
+            )
+            assert (
+                not self.is_dynamic
+            ), "Dynamic quantization is not supported in Mindspore models yet."
+            if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
+                return UnquantizedLinearMethod()
+            return MSW8A8LinearMethod(self)
+        return None
+
+
+class MSW8A8LinearMethod(LinearMethodBase):
+    """Linear method for NPU quantization.
+
+    This class search for specific quantization
+    implementation supported on NPU hardware for linear methods.
+
+    Args:
+        quant_config: The NPU quantization config.
+    """
+
+    def __init__(self, quantization_config: W8A8Int8Config) -> None:
+        self.quantization_config = quantization_config
+
+    def create_weights(
+        self,
+        layer: ms.nn.Cell,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: ms.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        output_size_per_partition = sum(output_partition_sizes)
+
+        """
+        params_dict["input_scale"] = torch.empty(1, dtype=params_dtype)
+        params_dict["input_offset"] = torch.empty(1, dtype=params_dtype)
+
+        params_dict["quant_bias"] = torch.empty(output_size, dtype=torch.int32)
+        if params_dtype == torch.bfloat16:
+            params_dict["deq_scale"] = torch.empty(output_size, dtype=torch.float32)
+        elif params_dtype == torch.float16:
+            params_dict["deq_scale"] = torch.empty(output_size, dtype=torch.int64)
+        params_dict["weight_scale"] = torch.empty(output_size, 1, dtype=params_dtype)
+        params_dict["weight_offset"] = torch.empty(output_size, 1, dtype=params_dtype)
+        """
+
+        q_weight_dict = {
+            "weight": ms.mint.zeros(
+                (sum(output_partition_sizes), input_size_per_partition), dtype=ms.int8
+            ),
+            "input_scale": ms.mint.zeros(1, dtype=ms.float32),
+            "input_offset": ms.mint.zeros(1, dtype=ms.float32),
+            "quant_bias": ms.mint.zeros(output_size_per_partition, dtype=ms.int32),
+            "deq_scale": ms.mint.zeros(
+                output_size_per_partition,
+                dtype=ms.float32 if params_dtype == ms.bfloat16 else ms.int64,
+            ),
+            "weight_scale": ms.mint.zeros(
+                [output_size_per_partition, 1], dtype=params_dtype
+            ),
+            "weight_offset": ms.mint.zeros(
+                [output_size_per_partition, 1], dtype=params_dtype
+            ),
+        }
+
+        for name, data in q_weight_dict.items():
+            param = ms.Parameter(data, requires_grad=False)
+            set_weight_attrs(param, {"input_dim": 1, "output_dim": 0})
+            set_weight_attrs(param, extra_weight_attrs)
+            layer.insert_param_to_cell(name, param)
+
+        self.matmul = ms.ops.auto_generate.QuantBatchMatmul(
+            transpose_x1=False, transpose_x2=True, dtype=params_dtype
+        )
+        self.quant = QuantV2()
+
+    def process_weights_after_loading(self, layer: ms.nn.Cell) -> None:
+        input_scale_reciprocal = ms.Parameter(
+            1.0 / layer.input_scale, requires_grad=False
+        )
+        layer.insert_param_to_cell("input_scale_reciprocal", input_scale_reciprocal)
+
+    def apply(
+        self,
+        layer: ms.nn.Cell,
+        x: ms.Tensor,
+        bias: Optional[ms.Tensor] = None,
+    ) -> ms.Tensor:
+
+        original_dtype = x.dtype
+        if original_dtype != ms.int8:
+            x = x.to(layer.input_scale.dtype)
+            qx = self.quant(
+                x,
+                layer.input_scale_reciprocal,
+                layer.input_offset,
+                False,
+                "ROUND",
+                ms.dtype.int8,
+            )
+        else:
+            qx = x
+        # Only fuse bias add into GEMM for rank 0 (this ensures that
+        # bias will not get added more than once in Attention TP>1 case)
+        if isinstance(layer, RowParallelLinear) and layer.tp_rank > 0:
+            quant_bias = ms.mint.zeros_like(layer.quant_bias)
+        else:
+            quant_bias = layer.quant_bias
+        output = self.matmul(
+            qx,
+            layer.weight,
+            layer.deq_scale,
+            None,
+            quant_bias,
+            None,
+        )
+        if bias is not None:
+            output = output + bias
+        return output

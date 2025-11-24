@@ -12,14 +12,6 @@ def tensor_torch2ms(x: torch.Tensor):
     if x is None or not isinstance(x, torch.Tensor):
         return x
 
-    if x.device.type == "cpu":
-        # TODO: dlpack support CPU, for now will slow down the weight loading
-        if x.dtype == torch.bfloat16:
-            return ms.Tensor(
-                x.contiguous().to(torch.float32).numpy(), dtype=ms.bfloat16
-            )
-        return ms.Tensor(x.contiguous().numpy())
-
     # torch tensor -> dlpack -> mindspore tensor
     pt_dlpack = torch.utils.dlpack.to_dlpack(x)
     ms_tensor = ms_from_dlpack(pt_dlpack)
@@ -29,13 +21,6 @@ def tensor_torch2ms(x: torch.Tensor):
 def tensor_ms2torch(x: ms.Tensor):
     if x is None or not isinstance(x, ms.Tensor):
         return x
-
-    if x.device == "CPU":  # TODO: dlpack support CPU
-        if x.dtype == ms.bfloat16:
-            return torch.tensor(
-                x.contiguous().to(ms.float32).asnumpy(), dtype=torch.bfloat16
-            )
-        return torch.tensor(x.contiguous().asnumpy())
 
     # ms tensor -> dlpack -> torch tensor
     ms_dlpack = ms_to_dlpack(x)
@@ -74,3 +59,23 @@ def set_weight_attrs(weight, weight_attrs):
         return
     for key, value in weight_attrs.items():
         setattr(weight, key, value)
+
+
+def get_ms_dtype(dtype: torch.dtype):
+    type_name = str(dtype).split(".")[-1]
+    if hasattr(ms.dtype, type_name):
+        return getattr(ms.dtype, type_name)
+    raise ValueError(f"MindSpore dtype {type_name} is not supported.")
+
+
+def add_prefix(name: str, prefix: str) -> str:
+    """Add a weight path prefix to a module name.
+
+    Args:
+        name: base module name.
+        prefix: weight prefix str to added to the front of `name` concatenated with `.`.
+
+    Returns:
+        The string `prefix.name` if prefix is non-empty, otherwise just `name`.
+    """
+    return name if not prefix else f"{prefix}.{name}"
