@@ -73,25 +73,16 @@ class MSW8A8LinearMethod(LinearMethodBase):
     ) -> None:
         output_size_per_partition = sum(output_partition_sizes)
 
-        """
-        params_dict["input_scale"] = torch.empty(1, dtype=params_dtype)
-        params_dict["input_offset"] = torch.empty(1, dtype=params_dtype)
-
-        params_dict["quant_bias"] = torch.empty(output_size, dtype=torch.int32)
-        if params_dtype == torch.bfloat16:
-            params_dict["deq_scale"] = torch.empty(output_size, dtype=torch.float32)
-        elif params_dtype == torch.float16:
-            params_dict["deq_scale"] = torch.empty(output_size, dtype=torch.int64)
-        params_dict["weight_scale"] = torch.empty(output_size, 1, dtype=params_dtype)
-        params_dict["weight_offset"] = torch.empty(output_size, 1, dtype=params_dtype)
-        """
-
         q_weight_dict = {
             "weight": ms.mint.zeros(
                 (sum(output_partition_sizes), input_size_per_partition), dtype=ms.int8
             ),
+        }
+        per_tensor_weight_dict = {
             "input_scale": ms.mint.zeros(1, dtype=ms.float32),
             "input_offset": ms.mint.zeros(1, dtype=ms.float32),
+        }
+        per_channel_weight_dict = {
             "quant_bias": ms.mint.zeros(output_size_per_partition, dtype=ms.int32),
             "deq_scale": ms.mint.zeros(
                 output_size_per_partition,
@@ -108,6 +99,17 @@ class MSW8A8LinearMethod(LinearMethodBase):
         for name, data in q_weight_dict.items():
             param = ms.Parameter(data, requires_grad=False)
             set_weight_attrs(param, {"input_dim": 1, "output_dim": 0})
+            set_weight_attrs(param, extra_weight_attrs)
+            layer.insert_param_to_cell(name, param)
+
+        for name, data in per_tensor_weight_dict.items():
+            param = ms.Parameter(data, requires_grad=False)
+            set_weight_attrs(param, extra_weight_attrs)
+            layer.insert_param_to_cell(name, param)
+
+        for name, data in per_channel_weight_dict.items():
+            param = ms.Parameter(data, requires_grad=False)
+            set_weight_attrs(param, {"output_dim": 0})
             set_weight_attrs(param, extra_weight_attrs)
             layer.insert_param_to_cell(name, param)
 
