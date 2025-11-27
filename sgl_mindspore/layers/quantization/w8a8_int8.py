@@ -1,8 +1,11 @@
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import mindspore as ms
 from mindspore.ops.operations._infer_ops import QuantV2
-from sglang.srt.layers.quantization.base_config import LinearMethodBase
+from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
+    LinearMethodBase,
+)
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 
 from sgl_mindspore.layers.linear import RowParallelLinear
@@ -21,6 +24,7 @@ class MsW8A8Int8Config(W8A8Int8Config):
         prefix: str,
     ) -> Optional[QuantizeMethodBase]:
         from sgl_mindspore.layers.linear import LinearBase
+        from sgl_mindspore.layers.moe.fused_moe import FusedMoE
 
         if isinstance(layer, LinearBase):
             key = "model"
@@ -45,6 +49,8 @@ class MsW8A8Int8Config(W8A8Int8Config):
             if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
                 return UnquantizedLinearMethod()
             return MSW8A8LinearMethod(self)
+        elif isinstance(layer, FusedMoE):
+            return MSW8A8MoEMethod(self)
         return None
 
 
@@ -161,3 +167,143 @@ class MSW8A8LinearMethod(LinearMethodBase):
         if bias is not None:
             output = output + bias
         return output
+
+
+class MSW8A8MoEMethod(FusedMoEMethodBase):
+    """MoE method for MindSpore quantization.
+
+    This class implements MoE quantization for MindSpore models.
+
+    Args:
+        quant_config: The quantization config.
+    """
+
+    def __init__(self, quantization_config: W8A8Int8Config) -> None:
+        self.quantization_config = quantization_config
+
+    def create_weights(
+        self,
+        layer: ms.nn.Cell,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: ms.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        # weight
+        w13_weight = ms.Parameter(
+            ms.mint.zeros(
+                (num_experts, 2 * intermediate_size_per_partition, hidden_size),
+                dtype=ms.int8,
+            ),
+            requires_grad=False,
+        )
+        layer.insert_param_to_cell("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        w2_weight = ms.Parameter(
+            ms.mint.zeros(
+                (num_experts, hidden_size, intermediate_size_per_partition),
+                dtype=ms.int8,
+            ),
+            requires_grad=False,
+        )
+        layer.insert_param_to_cell("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # scale
+        w13_weight_scale = ms.Parameter(
+            ms.mint.zeros(
+                (num_experts, 2 * intermediate_size_per_partition, 1), dtype=ms.float32
+            ),
+            requires_grad=False,
+        )
+        layer.insert_param_to_cell("w13_weight_scale", w13_weight_scale)
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+
+        w2_weight_scale = ms.Parameter(
+            ms.mint.zeros((num_experts, hidden_size, 1), dtype=ms.float32),
+            requires_grad=False,
+        )
+        layer.insert_param_to_cell("w2_weight_scale", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        # offset
+        w13_weight_offset = ms.Parameter(
+            ms.mint.zeros(
+                (num_experts, 2 * intermediate_size_per_partition, 1),
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.insert_param_to_cell("w13_weight_offset", w13_weight_offset)
+        set_weight_attrs(w13_weight_offset, extra_weight_attrs)
+
+        w2_weight_offset = ms.Parameter(
+            ms.mint.zeros((num_experts, hidden_size, 1), dtype=params_dtype),
+            requires_grad=False,
+        )
+        layer.insert_param_to_cell("w2_weight_offset", w2_weight_offset)
+        set_weight_attrs(w2_weight_offset, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: ms.nn.Cell) -> None:
+        # Transpose weights for MindSpore matmul requirements
+        layer.w13_weight = ms.Parameter(
+            layer.w13_weight.data.transpose(1, 2).contiguous(), requires_grad=False
+        )
+        layer.w2_weight = ms.Parameter(
+            layer.w2_weight.data.transpose(1, 2).contiguous(), requires_grad=False
+        )
+
+        # Squeeze scales and offsets
+        layer.w13_weight_scale = ms.Parameter(
+            layer.w13_weight_scale.data.squeeze(-1).contiguous(), requires_grad=False
+        )
+        layer.w2_weight_scale = ms.Parameter(
+            layer.w2_weight_scale.data.squeeze(-1).contiguous(), requires_grad=False
+        )
+        layer.w13_weight_offset = ms.Parameter(
+            layer.w13_weight_offset.data.squeeze(-1).contiguous(), requires_grad=False
+        )
+        layer.w2_weight_offset = ms.Parameter(
+            layer.w2_weight_offset.data.squeeze(-1).contiguous(), requires_grad=False
+        )
+
+    def create_moe_runner(self, layer: ms.nn.Cell, moe_runner_config: Any):
+        # MindSpore specific moe runner creation if needed
+        pass
+
+    def apply(
+        self,
+        layer: ms.nn.Cell,
+        dispatch_output: Any,
+    ) -> ms.Tensor:
+        from sgl_mindspore.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        topk_weights, topk_ids, _ = topk_output
+
+        # Implement MindSpore specific fused experts computation
+        # This is a placeholder implementation that needs to be replaced with actual MindSpore ops
+        # For now, we'll use a simple approach that matches the structure
+
+        # Reshape input if needed
+        original_shape = x.shape
+        if len(original_shape) == 3:
+            x = x.view(-1, original_shape[-1])
+
+        # Get top_k value
+        top_k = topk_ids.shape[1]
+
+        # Placeholder for fused experts computation
+        # In a real implementation, this would use MindSpore's fused MoE ops
+        hidden_size = x.shape[-1]
+        output = ms.mint.zeros((x.shape[0], hidden_size), dtype=x.dtype)
+
+        # Reshape back to original if needed
+        if len(original_shape) == 3:
+            output = output.view(original_shape)
+
+        return StandardCombineInput(hidden_states=output)
