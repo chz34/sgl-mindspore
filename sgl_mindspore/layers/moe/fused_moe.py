@@ -1,15 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
-from typing import Callable, Iterable, List, Optional, Tuple, Type, Union
+from typing import Callable, List, Optional, Tuple, Type
 
 import numpy as np
 import torch
-from mindspore import Parameter, Tensor, dtype, from_numpy, mint, nn, ops
+from mindspore import Parameter, Tensor, dtype, mint, nn, ops
 from mindspore.ops.auto_generate import (
     FusedAddTopKDiv,
     GroupedMatmulV4,
-    MoeDistributeCombine,
-    MoeDistributeDispatch,
     MoeInitRoutingV2,
     MoeTokenUnpermute,
 )
@@ -20,7 +18,6 @@ from sglang.srt.distributed import (
 
 from sgl_mindspore.utils import (
     _get_tp_group_name,
-    _get_world_group_name,
     split_loaded_weight,
     tensor_torch2ms,
 )
@@ -479,9 +476,8 @@ class FusedMoe(nn.Cell):
         )
 
         if is_param_transpose:
-            loaded_weight = from_numpy(loaded_weight.swapaxes(-1, -2))
-        else:
-            loaded_weight = from_numpy(loaded_weight)
+            loaded_weight = loaded_weight.transpose(-1, -2)
+        loaded_weight = tensor_torch2ms(loaded_weight.contiguous())
 
         if shard_id == "w1":
             if is_param_transpose:
@@ -522,16 +518,14 @@ class FusedMoe(nn.Cell):
             )
 
             if is_param_transpose:
-                loaded_weight = from_numpy(loaded_weight.swapaxes(-1, -2))
-            else:
-                loaded_weight = from_numpy(loaded_weight)
+                loaded_weight = loaded_weight.transpose(-1, -2)
+            loaded_weight = tensor_torch2ms(loaded_weight.contiguous())
 
             param[expert_id] = loaded_weight
         else:
             if is_param_transpose:
-                loaded_weight = from_numpy(loaded_weight.swapaxes(-1, -2))
-            else:
-                loaded_weight = from_numpy(loaded_weight)
+                loaded_weight = loaded_weight.transpose(-1, -2)
+            loaded_weight = tensor_torch2ms(loaded_weight.contiguous())
 
             param.set_data(loaded_weight)
 
@@ -570,9 +564,8 @@ class FusedMoe(nn.Cell):
         )
         loaded_weight = loaded_weight[:]
         if is_param_transpose:
-            loaded_weight = from_numpy(loaded_weight.swapaxes(-1, -2))
-        else:
-            loaded_weight = from_numpy(loaded_weight)
+            loaded_weight = loaded_weight.transpose(-1, -2)
+        loaded_weight = tensor_torch2ms(loaded_weight.contiguous())
         param[expert_id] = loaded_weight
 
     def _load_g_idx(
@@ -599,9 +592,8 @@ class FusedMoe(nn.Cell):
             )
             loaded_weight = loaded_weight[:]
             if is_param_transpose:
-                loaded_weight = from_numpy(loaded_weight.swapaxes(-1, -2))
-            else:
-                loaded_weight = from_numpy(loaded_weight)
+                loaded_weight = loaded_weight.transpose(-1, -2)
+            loaded_weight = tensor_torch2ms(loaded_weight.contiguous())
             param[expert_id] = loaded_weight
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
@@ -617,7 +609,6 @@ class FusedMoe(nn.Cell):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        loaded_weight = loaded_weight.contiguous().to(torch.float32).numpy()
         expert_id = self._map_global_expert_id_to_local_expert_id(expert_id=expert_id)
         if expert_id == -1:
             return
