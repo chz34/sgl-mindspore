@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+import sys
+import traceback
+
 import mindspore as ms
 import torch
 import torch_npu
@@ -79,3 +82,9 @@ def add_prefix(name: str, prefix: str) -> str:
         The string `prefix.name` if prefix is non-empty, otherwise just `name`.
     """
     return name if not prefix else f"{prefix}.{name}"
+
+
+def get_exception_traceback():
+    etype, value, tb = sys.exc_info()
+    err_str = "".join(traceback.format_exception(etype, value, tb))
+    return err_str

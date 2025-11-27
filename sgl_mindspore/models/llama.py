@@ -188,9 +188,10 @@ class LlamaAttention(nn.Cell):
             dim=-1,
         )
 
-        q = q.view(-1, self.num_heads // self.tp_size, self.head_dim)
-        k = k.view(-1, self.num_kv_heads // self.tp_size, self.head_dim)
-        v = v.view(-1, self.num_kv_heads // self.tp_size, self.head_dim)
+        # Reshape to 2D format as required by attention mechanism
+        q = q.view(-1, self.num_heads // self.tp_size * self.head_dim)
+        k = k.view(-1, self.num_kv_heads // self.tp_size * self.head_dim)
+        v = v.view(-1, self.num_kv_heads // self.tp_size * self.head_dim)
 
         q, k = self.rotary_emb(
             positions,
@@ -446,6 +447,11 @@ class LlamaForCausalLM(MindSporeModelBase):
             tensor_torch2ms(weight).to(param.dtype)
         )
 
+        os.environ["MS_INTERNAL_DISABLE_CUSTOM_KERNEL_LIST"] = (
+            "FlashAttentionScore,PagedAttention"
+        )
+        os.environ["MS_DISABLE_INTERNAL_KERNELS_LIST"] = "RmsNorm"
+
     def set_model_inputs(self, is_prefill):
         dyn_input_ids = Tensor(shape=[None], dtype=dtype.int32)
         dyn_position_ids = Tensor(shape=[None], dtype=dtype.int64)
@@ -641,6 +647,11 @@ class LlamaForCausalLM(MindSporeModelBase):
         if self.prev_prefill != is_prefill:
             self.set_model_inputs(is_prefill)
         self.prev_prefill = is_prefill
+
+        if is_prefill:
+            self.model.phase = "prefill"
+        else:
+            self.model.phase = "increment"
 
         hidden_state = self.model(**model_inputs)
 
