@@ -1,29 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
-from typing import Callable, Iterable, List, Optional, Tuple, Type, Union
+from typing import Callable, List, Optional, Tuple, Type
 
 import numpy as np
 import torch
-from mindspore import Parameter, Tensor, dtype, from_numpy, mint, nn, ops
+from mindspore import Parameter, Tensor, dtype, mint, nn, ops
 from mindspore.ops.auto_generate import (
     FusedAddTopKDiv,
     GroupedMatmulV4,
-    MoeDistributeCombine,
-    MoeDistributeDispatch,
     MoeInitRoutingV2,
     MoeTokenUnpermute,
 )
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 from sgl_mindspore.utils import (
     _get_tp_group_name,
-    _get_world_group_name,
     split_loaded_weight,
     tensor_torch2ms,
 )
+from sgl_mindspore.layers.quantization.unquant import UnquantizedFusedMoEFFNMethod
 
 
 def fused_topk(
@@ -87,12 +85,14 @@ class FusedExperts(nn.Cell):
         tp_ep: bool,
         optim_tp_ep_gating_perf: bool,
         use_all2all_kernels: bool,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
 
         self.group_matmul_op = GroupedMatmulV4()
         self.moe_init_routing_op = MoeInitRoutingV2()
         self.moe_token_unpermute = MoeTokenUnpermute()
+        self.quant_method = None
 
         self.pure_tp = True
         self.pure_ep = False
@@ -134,9 +134,8 @@ class FusedExperts(nn.Cell):
 
     def construct(
         self,
+        layer: nn.Cell,
         hidden_states: Tensor,
-        w1: Tensor,
-        w2: Tensor,
         topk_weights: Tensor,
         topk_ids: Tensor,
         activation: str = "silu",
@@ -145,9 +144,8 @@ class FusedExperts(nn.Cell):
     ) -> Tensor:
         if self.pure_tp:
             hidden_states = self.run_tp_moe(
+                layer,
                 hidden_states,
-                w1,
-                w2,
                 topk_ids,
                 topk_weights,
                 activation,
@@ -156,9 +154,8 @@ class FusedExperts(nn.Cell):
             )
         elif self.pure_ep:
             hidden_states = self.run_ep_moe(
+                layer,
                 hidden_states,
-                w1,
-                w2,
                 topk_ids,
                 topk_weights,
                 activation,
@@ -167,9 +164,8 @@ class FusedExperts(nn.Cell):
             )
         else:
             hidden_states = self.run_tp_ep_moe(
+                layer,
                 hidden_states,
-                w1,
-                w2,
                 topk_ids,
                 topk_weights,
                 activation,
@@ -202,26 +198,13 @@ class FusedExperts(nn.Cell):
             group_list_type=1,
         )[0]
 
-    def _ffn(self, hidden_states, w1, w2, group_list, activation):
-        gate_hidden_out = self._group_matmul(
-            hidden_states=hidden_states, weight=w1, group_list=group_list
-        )
-        gate, hidden = mint.split(
-            gate_hidden_out, (w1.shape[2] // 2, w1.shape[2] // 2), -1
-        )
-        gate = self._gate_activation(gate=gate, activation=activation)
-        hidden = mint.mul(hidden, gate)
-        expert_output = self._group_matmul(
-            hidden_states=hidden, weight=w2, group_list=group_list
-        )
-        expert_output = mint.nan_to_num(expert_output, 0, 0, 0)
-        return expert_output
+    def _ffn(self, layer, hidden_states, group_list, activation):
+        return self.quant_method.apply(layer, hidden_states, group_list, activation)
 
     def run_tp_moe(
         self,
+        layer: nn.Cell,
         hidden_states: Tensor,
-        w1: Tensor,
-        w2: Tensor,
         topk_ids: Tensor,
         topk_weights: Tensor,
         activation: str = "silu",
@@ -243,9 +226,8 @@ class FusedExperts(nn.Cell):
         )
         group_list = group_list.astype(dtype.int64)
         expert_output = self._ffn(
+            layer,
             sorted_input_tensor,
-            w1=w1,
-            w2=w2,
             group_list=group_list,
             activation=activation,
         )
@@ -261,9 +243,8 @@ class FusedExperts(nn.Cell):
 
     def run_tp_ep_moe(
         self,
+        layer: nn.Cell,
         hidden_states: Tensor,
-        w1: Tensor,
-        w2: Tensor,
         topk_ids: Tensor,
         topk_weights: Tensor,
         activation: str = "silu",
@@ -301,9 +282,8 @@ class FusedExperts(nn.Cell):
         group_list = group_list[: self.local_experts_num]
         group_list = group_list.astype(dtype.int64)
         expert_output = self._ffn(
+            layer,
             sorted_input_tensor,
-            w1=w1,
-            w2=w2,
             group_list=group_list,
             activation=activation,
         )
@@ -318,9 +298,8 @@ class FusedExperts(nn.Cell):
 
     def run_ep_moe(
         self,
+        layer: nn.Cell,
         hidden_states: Tensor,
-        w1: Tensor,
-        w2: Tensor,
         topk_ids: Tensor,
         topk_weights: Tensor,
         activation: str = "silu",
@@ -334,9 +313,8 @@ class FusedExperts(nn.Cell):
 
     def _ep_with_dispatch_combine(
         self,
+        layer,
         hidden_states,
-        w1,
-        w2,
         topk_ids,
         topk_weights,
         activation,
@@ -372,6 +350,8 @@ class FusedMoe(nn.Cell):
         activation: str = "silu",
         num_redundant_experts: int = 0,
         optim_tp_ep_gating_perf: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -413,30 +393,6 @@ class FusedMoe(nn.Cell):
         self.custom_routing_function = custom_routing_function
         self.e_score_correction_bias = e_score_correction_bias
 
-        self.w13_weight = Parameter(
-            mint.empty(
-                self.global_num_experts,
-                self.hidden_size,
-                2 * self.intermediate_size_per_partition,
-                dtype=self.param_dtype,
-            ),
-            requires_grad=False,
-        )
-        setattr(self.w13_weight, "weight_load", self.weight_load)
-        setattr(self.w13_weight, "is_transpose", True)
-
-        self.w2_weight = Parameter(
-            mint.empty(
-                self.global_num_experts,
-                self.intermediate_size_per_partition,
-                self.hidden_size,
-                dtype=self.param_dtype,
-            ),
-            requires_grad=False,
-        )
-        setattr(self.w2_weight, "weight_load", self.weight_load)
-        setattr(self.w2_weight, "is_transpose", True)
-
         self.all_reduce_from_tp_group = ops.AllReduce(group=self.tp_group)
         self.fused_experts = FusedExperts(
             num_experts=self.global_num_experts,
@@ -451,6 +407,20 @@ class FusedMoe(nn.Cell):
             tp_ep=self.tp_ep,
             optim_tp_ep_gating_perf=self.optim_tp_ep_gating_perf,
             use_all2all_kernels=False,
+        )
+
+        if quant_config is None:
+            quant_method = UnquantizedFusedMoEFFNMethod()
+        else:
+            quant_method = quant_config.get_quant_method(self, prefix)
+        self.fused_experts.quant_method = quant_method
+        quant_method.create_weights(
+            self,
+            self.global_num_experts,
+            self.hidden_size,
+            self.intermediate_size_per_partition,
+            self.param_dtype,
+            extra_weight_attrs={"weight_load": self.weight_load, "is_transpose": True},
         )
 
     def _load_w13(
@@ -479,9 +449,8 @@ class FusedMoe(nn.Cell):
         )
 
         if is_param_transpose:
-            loaded_weight = from_numpy(loaded_weight.swapaxes(-1, -2))
-        else:
-            loaded_weight = from_numpy(loaded_weight)
+            loaded_weight = loaded_weight.transpose(-1, -2)
+        loaded_weight = tensor_torch2ms(loaded_weight.contiguous())
 
         if shard_id == "w1":
             if is_param_transpose:
@@ -522,16 +491,14 @@ class FusedMoe(nn.Cell):
             )
 
             if is_param_transpose:
-                loaded_weight = from_numpy(loaded_weight.swapaxes(-1, -2))
-            else:
-                loaded_weight = from_numpy(loaded_weight)
+                loaded_weight = loaded_weight.transpose(-1, -2)
+            loaded_weight = tensor_torch2ms(loaded_weight.contiguous())
 
             param[expert_id] = loaded_weight
         else:
             if is_param_transpose:
-                loaded_weight = from_numpy(loaded_weight.swapaxes(-1, -2))
-            else:
-                loaded_weight = from_numpy(loaded_weight)
+                loaded_weight = loaded_weight.transpose(-1, -2)
+            loaded_weight = tensor_torch2ms(loaded_weight.contiguous())
 
             param.set_data(loaded_weight)
 
@@ -568,11 +535,9 @@ class FusedMoe(nn.Cell):
         is_param_transpose = (
             param.is_transpose if hasattr(param, "is_transpose") else False
         )
-        loaded_weight = loaded_weight[:]
         if is_param_transpose:
-            loaded_weight = from_numpy(loaded_weight.swapaxes(-1, -2))
-        else:
-            loaded_weight = from_numpy(loaded_weight)
+            loaded_weight = loaded_weight.transpose(-1, -2)
+        loaded_weight = tensor_torch2ms(loaded_weight.contiguous())
         param[expert_id] = loaded_weight
 
     def _load_g_idx(
@@ -597,11 +562,9 @@ class FusedMoe(nn.Cell):
             is_param_transpose = (
                 param.is_transpose if hasattr(param, "is_transpose") else False
             )
-            loaded_weight = loaded_weight[:]
             if is_param_transpose:
-                loaded_weight = from_numpy(loaded_weight.swapaxes(-1, -2))
-            else:
-                loaded_weight = from_numpy(loaded_weight)
+                loaded_weight = loaded_weight.transpose(-1, -2)
+            loaded_weight = tensor_torch2ms(loaded_weight.contiguous())
             param[expert_id] = loaded_weight
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
@@ -617,7 +580,6 @@ class FusedMoe(nn.Cell):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        loaded_weight = loaded_weight.contiguous().to(torch.float32).numpy()
         expert_id = self._map_global_expert_id_to_local_expert_id(expert_id=expert_id)
         if expert_id == -1:
             return
@@ -754,9 +716,8 @@ class FusedMoe(nn.Cell):
         )
 
         final_hidden_states = self.fused_experts(
+            layer=self,
             hidden_states=hidden_states,
-            w1=self.w13_weight,
-            w2=self.w2_weight,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             activation=self.activation,
