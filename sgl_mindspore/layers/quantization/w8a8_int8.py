@@ -1,19 +1,17 @@
 from typing import List, Optional
 
 import mindspore as ms
-from mindspore import mint
 from mindspore import dtype as msdtype
-from mindspore.ops.operations._infer_ops import QuantV2
+from mindspore import mint
 from mindspore.ops.auto_generate import (
-    WeightQuantBatchMatmul,
-    QuantBatchMatmul,
+    DequantSwigluQuant,
     DynamicQuantExt,
     GroupedMatmulV4,
-    DequantSwigluQuant,
+    QuantBatchMatmul,
+    WeightQuantBatchMatmul,
 )
-from sglang.srt.layers.quantization.base_config import (
-    LinearMethodBase,
-)
+from mindspore.ops.operations._infer_ops import QuantV2
+from sglang.srt.layers.quantization.base_config import LinearMethodBase
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 
 from sgl_mindspore.layers.linear import RowParallelLinear
@@ -53,10 +51,14 @@ class MsW8A8Int8Config(W8A8Int8Config):
             )
             if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
                 return UnquantizedLinearMethod()
-            return MSW8A8DynamicLinearMethod(self) if self.is_dynamic else MSW8A8LinearMethod(self)
+            return (
+                MSW8A8DynamicLinearMethod(self)
+                if self.is_dynamic
+                else MSW8A8LinearMethod(self)
+            )
         elif isinstance(layer, FusedMoe):
             return MSW8A8FusedMoEFFNMethod(self)
-        
+
         return None
 
 
@@ -275,29 +277,36 @@ class MSW8A8FusedMoEFFNMethod(QuantizeMethodBase):
         w13_weight = ms.Parameter(
             mint.empty(
                 num_experts,
-                2 * intermediate_size_per_partition,
                 hidden_size,
+                2 * intermediate_size_per_partition,
                 dtype=msdtype.int8,
             ),
             requires_grad=False,
         )
         layer.insert_param_to_cell("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
+        setattr(w13_weight, "is_transpose", True)
+
         w2_weight = ms.Parameter(
             mint.empty(
                 num_experts,
-                hidden_size,
                 intermediate_size_per_partition,
+                hidden_size,
                 dtype=msdtype.int8,
             ),
             requires_grad=False,
         )
         layer.insert_param_to_cell("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
+        setattr(w2_weight, "is_transpose", True)
+
         # scale
         w13_weight_scale = ms.Parameter(
             mint.empty(
-                num_experts, 2 * intermediate_size_per_partition, 1, dtype=msdtype.float32
+                num_experts,
+                2 * intermediate_size_per_partition,
+                1,
+                dtype=msdtype.float32,
             ),
             requires_grad=False,
         )
@@ -312,7 +321,10 @@ class MSW8A8FusedMoEFFNMethod(QuantizeMethodBase):
         # offset
         w13_weight_offset = ms.Parameter(
             mint.empty(
-                num_experts, 2 * intermediate_size_per_partition, 1, dtype=msdtype.float32
+                num_experts,
+                2 * intermediate_size_per_partition,
+                1,
+                dtype=msdtype.float32,
             ),
             requires_grad=False,
         )
@@ -345,12 +357,13 @@ class MSW8A8FusedMoEFFNMethod(QuantizeMethodBase):
         group_list_type = 1
 
         hidden_states, hidden_states_scale = self.dynamic_quant(hidden_states)
+        hidden_states_scale = hidden_states_scale.view(-1, 1)
 
         # gmm1: gate_up_proj
         hidden_states = self.group_matmul(
             x=[hidden_states],
             weight=[layer.w13_weight],
-            split_item=2,
+            split_item=3,
             group_list_type=group_list_type,
             group_type=0,
             group_list=group_list,
@@ -360,23 +373,23 @@ class MSW8A8FusedMoEFFNMethod(QuantizeMethodBase):
         # act_fn: swiglu
         hidden_states, swiglu_out_scale = self.dequant_swiglu_quant(
             x=hidden_states,
-            weight_scale=layer.w13_weight_scale.to(msdtype.float32),
+            weight_scale=layer.w13_weight_scale.squeeze(-1),
             activation_scale=hidden_states_scale,
             bias=None,
             quant_scale=None,
             quant_offset=None,
             group_index=group_list,
             activate_left=True,
-            quant_mode=1,
+            quant_mode="dynamic",
         )
 
         # gmm2: down_proj
         hidden_states = self.group_matmul(
             x=[hidden_states],
             weight=[layer.w2_weight],
-            scale=[layer.w2_weight_scale.to(output_dtype)],
-            per_token_scale=[swiglu_out_scale],
-            split_item=2,
+            scale=[layer.w2_weight_scale.to(output_dtype).squeeze(-1)],
+            pre_token_scale=[swiglu_out_scale],
+            split_item=3,
             group_list_type=group_list_type,
             group_type=0,
             group_list=group_list,
