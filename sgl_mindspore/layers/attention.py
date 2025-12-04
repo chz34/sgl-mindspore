@@ -61,10 +61,11 @@ class MsNativeAttnBackend(nn.Cell):
             if k_scale is not None:
                 key = key / k_scale
             key = key.to(key_cache.dtype)
-        if value and value.dtype != value_cache.dtype:
-            if v_scale is not None:
-                value = value / v_scale
-            value = value.to(value_cache.dtype)
+        if value:
+            if value.dtype != value_cache.dtype:
+                if v_scale is not None:
+                    value = value / v_scale
+                value = value.to(value_cache.dtype)
         cache_out = self.reshape_and_cache(
             key, value, key_cache, value_cache, out_cache_loc
         )
