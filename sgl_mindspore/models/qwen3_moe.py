@@ -34,6 +34,7 @@ from sgl_mindspore.layers import (
     VocabParallelEmbedding,
     YaRNScalingRotaryEmbedding,
 )
+from sgl_mindspore.layers.quantization.base_config import get_ms_quant_config
 from sgl_mindspore.models.mindspore_model_base import MindSporeModelBase
 from sgl_mindspore.utils import _get_tp_group_name, add_prefix, tensor_torch2ms
 
@@ -172,8 +173,6 @@ class Qwen3MoeAttention(nn.Cell):
             config.num_attention_heads // self.tp_size,
             config.head_dim,
             config.num_key_value_heads // self.tp_size,
-            quant_config=quant_config,
-            prefix=add_prefix("qkv_proj", prefix),
         )
 
         self.qkv_proj = QKVParallelLinear(
@@ -487,6 +486,7 @@ class Qwen3MoeForCausalLM(MindSporeModelBase):
 
         self.config = config
         setattr(self.config, "param_dtype", dtype.bfloat16)
+        quant_config = get_ms_quant_config(quant_config)
         self.model = Qwen3MoeModel(self.config, quant_config=quant_config)
 
         self.lm_head = ColParallelLinear(
