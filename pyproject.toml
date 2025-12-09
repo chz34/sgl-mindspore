@@ -16,9 +16,13 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
 ]
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [
-    # Add your dependencies here
-    # "mindspore>=1.8.0",
     "sglang",
+    "mindspore==2.7.2",
+    "torch==2.8.0",
+    "torch_npu==2.8.0",
+    "torchvision",
+    "triton-ascend",
+    "pybind11",
 ]
