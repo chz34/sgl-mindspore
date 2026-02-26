@@ -5,11 +5,12 @@ from typing import Optional, Tuple, Type, Union
 
 import numpy as np
 from mindspore import Tensor, from_numpy, mint, nn, ops
-from sglang.srt.layers.rotary_embedding import (
-    _yarn_find_correction_dim,
-    _yarn_find_correction_range,
-    yarn_get_mscale,
-)
+
+
+def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
 
 
 def _yarn_get_mscale(scale: float = 1) -> float:
