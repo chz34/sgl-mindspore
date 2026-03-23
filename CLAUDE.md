@@ -17,7 +17,7 @@ sgl-mindspore/
 │   │   ├── llama_eagle3.py
 │   │   ├── qwen3.py
 │   │   ├── qwen3_moe.py
-│   │   ├── qwen3_5.py       # Hybrid attention (full-attn + GatedDeltaNet); entries: Qwen3_5ForConditionalGeneration (text), Qwen3_5VLForConditionalGeneration (VL)
+│   │   ├── qwen3_5.py       # Hybrid attention (full-attn + GatedDeltaNet); entries: Qwen3_5ForCausalLM (text), Qwen3_5ForConditionalGeneration (VL)
 │   │   └── deepseekv3.py
 │   ├── layers/              # Reusable layer primitives
 │   │   ├── __init__.py      # Public exports — update when adding new layers

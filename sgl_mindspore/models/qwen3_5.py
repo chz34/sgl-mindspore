@@ -968,7 +968,7 @@ class GatherLastDim(nn.Cell):
         return output
 
 
-class Qwen3_5ForConditionalGeneration(MindSporeModelBase):
+class Qwen3_5ForCausalLM(MindSporeModelBase):
     capture_aux_hidden_states = False
 
     def __init__(
@@ -1269,7 +1269,7 @@ _DEFAULT_IMAGE_TOKEN_ID = 151655
 _DEFAULT_VIDEO_TOKEN_ID = 151656
 
 
-class Qwen3_5VLForConditionalGeneration(MindSporeModelBase):
+class Qwen3_5ForConditionalGeneration(MindSporeModelBase):
     """Qwen3.5-VL: PyTorch vision encoder + MindSpore language decoder.
 
     The vision encoder (Qwen3VLMoeVisionModel from SGLang) runs via torch_npu.
@@ -1727,4 +1727,4 @@ class Qwen3_5VLForConditionalGeneration(MindSporeModelBase):
             ms.runtime.synchronize()
 
 
-EntryClass = [Qwen3_5ForConditionalGeneration, Qwen3_5VLForConditionalGeneration]
+EntryClass = [Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration]
