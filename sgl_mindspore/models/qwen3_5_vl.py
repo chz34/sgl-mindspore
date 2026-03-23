@@ -302,6 +302,14 @@ class Qwen3_5VLForConditionalGeneration(MindSporeModelBase):
 
         return model_inputs
 
+    def pad_input_ids(self, input_ids: List[int], mm_inputs):
+        from sglang.srt.managers.mm_utils import (
+            MultiModalityDataPaddingPatternMultimodalTokens,
+        )
+
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
+
     def set_model_inputs(self, is_prefill):
         pass
 
