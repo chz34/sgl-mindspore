@@ -17,7 +17,7 @@ sgl-mindspore/
 │   │   ├── llama_eagle3.py
 │   │   ├── qwen3.py
 │   │   ├── qwen3_moe.py
-│   │   ├── qwen3_5.py       # Hybrid attention (full-attn + GatedDeltaNet), entry: Qwen3_5ForConditionalGeneration
+│   │   ├── qwen3_5.py       # Hybrid attention (full-attn + GatedDeltaNet); entries: Qwen3_5ForConditionalGeneration (text), Qwen3_5VLForConditionalGeneration (VL)
 │   │   └── deepseekv3.py
 │   ├── layers/              # Reusable layer primitives
 │   │   ├── __init__.py      # Public exports — update when adding new layers
@@ -43,7 +43,7 @@ Every model file must:
 2. Implement `construct(self, **model_inputs) -> Tensor`
 3. Implement `load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]])`
 4. Optionally override `prepare_inputs(self, forward_batch, model_inputs)` for custom pre-processing (e.g., state management for recurrent models)
-5. End with `EntryClass = <ModelClass>` for dynamic registration by SGLang
+5. End with `EntryClass = <ModelClass>` (or a list) for dynamic registration by SGLang
 
 ```python
 class MyForCausalLM(MindSporeModelBase):
@@ -52,7 +52,19 @@ class MyForCausalLM(MindSporeModelBase):
     def set_model_inputs(self, is_prefill): ...  # called when prefill/decode mode switches
 
 EntryClass = MyForCausalLM
+# or for multiple variants:
+EntryClass = [MyForCausalLM, MyVLForConditionalGeneration]
 ```
+
+### Multimodal (VL) Models
+
+Follow the same file structure as SGLang: the VL model class lives in the **same file** as its text-only counterpart, not in a separate `*_vl.py` file. For example, `Qwen3_5VLForConditionalGeneration` is in `qwen3_5.py` alongside `Qwen3_5ForConditionalGeneration`, and `EntryClass` exports both.
+
+VL models use a hybrid execution strategy:
+- Vision encoder: PyTorch / torch_npu (stored via `object.__setattr__` to avoid MindSpore parameter registration)
+- Language model: MindSpore
+- Visual features are injected into text embeddings inside `prepare_inputs()` using `ops.tensor_scatter_update`
+- Must implement `pad_input_ids(input_ids, mm_inputs)` — the SGLang scheduler calls this unconditionally for multimodal requests
 
 ## Key Conventions
 
