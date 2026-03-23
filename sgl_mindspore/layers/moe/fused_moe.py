@@ -23,8 +23,8 @@ from sglang.srt.distributed import (
 
 from sgl_mindspore.utils import (
     _get_tp_group_name,
-    is_910b,
     is_310p,
+    is_910b,
     split_loaded_weight,
     tensor_torch2ms,
 )

@@ -144,7 +144,7 @@ class QKVParallelLinear(ColParallelLinear):
             self.num_kv_heads = divide(self.total_num_kv_head, tp_size)
             self.num_kv_head_replicas = 1
         input_size = self.hidden_size
-        output_size = ( self.num_heads + 2 * self.num_kv_heads ) * tp_size * self.head_dim
+        output_size = (self.num_heads + 2 * self.num_kv_heads) * tp_size * self.head_dim
 
         super().__init__(
             input_size=input_size,

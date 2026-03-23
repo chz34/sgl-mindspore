@@ -18,7 +18,6 @@ from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
 
 from sgl_mindspore.layers import (
     ColParallelLinear,
@@ -28,7 +27,7 @@ from sgl_mindspore.layers import (
     VocabParallelEmbedding,
 )
 from sgl_mindspore.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
-from sgl_mindspore.utils import get_ms_dtype, tensor_torch2ms
+from sgl_mindspore.utils import add_prefix, get_ms_dtype, tensor_torch2ms
 
 logger = logging.getLogger(__name__)
 
@@ -376,8 +375,10 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
         # TODO: In pure decode scenarios, cumsum and gather operations will be redundant .
         q_seq_lens = mint.cumsum(q_seq_lens, 0)
-        if not (forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()):
-            # In target verify mode, all tokens' logits are needed.
+        if forward_mode is None or not (
+            forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+        ):
+            # In target verify / draft extend v2 mode, all tokens' logits are needed.
             hidden_states = mint.index_select(hidden_states, 0, q_seq_lens - 1)
 
         logits = self.lm_head(hidden_states)

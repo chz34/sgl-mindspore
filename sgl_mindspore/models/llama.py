@@ -1,23 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
 import logging
-import math
 import os
-from functools import lru_cache
 from typing import Iterable, List, Optional, Tuple
 
 import mindspore as ms
-import mindspore.common.dtype as mstype
-import mindspore.ops.operations as P
-import numpy as np
 import torch
-from mindspore import Parameter, Tensor, dtype, jit, mint, mutable, nn, ops
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-    get_tp_group,
-)
-from sglang.srt.distributed.utils import divide
+from mindspore import Tensor, dtype, jit, mint, mutable, nn, ops
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 from sgl_mindspore.layers import (
@@ -37,7 +28,9 @@ from sgl_mindspore.models.mindspore_model_base import MindSporeModelBase
 from sgl_mindspore.utils import (
     _get_tp_group_name,
     add_prefix,
+    format_cast,
     get_ms_dtype,
+    is_310p,
     tensor_torch2ms,
 )
 
@@ -94,23 +87,18 @@ class LlamaAttention(nn.Cell):
     ) -> None:
         super().__init__()
 
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
+        self.attn_tp_size = attn_tp_size
         self.tp_size = get_tensor_model_parallel_world_size()
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % self.tp_size == 0
-        self.num_heads = self.total_num_heads // self.tp_size
         self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= self.tp_size:
-            assert self.total_num_kv_heads % self.tp_size == 0
-        else:
-            assert self.tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // self.tp_size)
+        assert self.total_num_heads % attn_tp_size == 0
         if hasattr(config, "head_dim"):
             self.head_dim = config.head_dim
         else:
-            self.head_dim = config.hidden_size // self.num_heads
-        self.q_size = self.head_dim * self.num_heads
-        self.kv_size = self.head_dim * self.num_kv_heads
+            self.head_dim = config.hidden_size // self.total_num_heads
         self.scaling = float(self.head_dim**-0.5)
         self.rope_theta = int(config.rope_theta)
         self.param_dtype = config.param_dtype
@@ -124,10 +112,23 @@ class LlamaAttention(nn.Cell):
         else:
             self.rope_type = "default_rope"
 
+        self.local_num_heads = self.total_num_heads // attn_tp_size
+        if self.total_num_kv_heads >= attn_tp_size:
+            assert self.total_num_kv_heads % attn_tp_size == 0
+            self.local_num_kv_heads = self.total_num_kv_heads // attn_tp_size
+        else:
+            assert attn_tp_size % self.total_num_kv_heads == 0
+            self.local_num_kv_heads = 1
+
+        self.local_q_size = self.local_num_heads * self.head_dim
+        self.local_kv_size = self.local_num_kv_heads * self.head_dim
+        self.q_size = self.total_num_heads * self.head_dim
+        self.kv_size = self.total_num_kv_heads * self.head_dim
+
         self.attn = MsNativeAttnBackend(
-            self.num_heads,
+            self.local_num_heads,
             self.head_dim,
-            self.num_kv_heads,
+            self.local_num_kv_heads,
         )
 
         self.qkv_proj = QKVParallelLinear(
@@ -139,16 +140,19 @@ class LlamaAttention(nn.Cell):
             param_dtype=self.param_dtype,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
         )
         self.o_proj = RowParallelLinear(
-            input_size=self.total_num_heads * self.head_dim,
+            input_size=self.q_size,
             output_size=self.hidden_size,
             param_dtype=self.param_dtype,
             bias=config.attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
         )
-        self.rotary_emb = None
         if self.rope_type == "yarn":
             self.rotary_emb = YaRNScalingRotaryEmbedding(
                 head_size=self.head_dim,
@@ -187,9 +191,9 @@ class LlamaAttention(nn.Cell):
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split(
             [
-                self.q_size,
-                self.kv_size,
-                self.kv_size,
+                self.local_q_size,
+                self.local_kv_size,
+                self.local_kv_size,
             ],
             dim=-1,
         )
@@ -217,15 +221,7 @@ class LlamaAttention(nn.Cell):
 
         if is_prefill:
             attn_output = self.attn.extend(
-                q,
-                k,
-                v,
-                attn_mask,
-                None,
-                None,
-                None,
-                batch_valid_length,
-                batch_valid_length,
+                q, k, v, attn_mask, None, None, None, q_seq_lens, batch_valid_length
             )
         else:
             attn_output = self.attn.decode(
@@ -433,6 +429,11 @@ class LlamaForCausalLM(MindSporeModelBase):
             param_dtype = get_ms_dtype(self.config.dtype)
         else:
             param_dtype = ms.dtype.bfloat16
+        if param_dtype == ms.bfloat16 and is_310p():
+            param_dtype = ms.float16
+            logger.warning(
+                "Ascend 310P does not support bfloat16, will convert to float16"
+            )
         setattr(self.config, "param_dtype", param_dtype)
         self.model = LlamaModel(
             self.config, quant_config=quant_config, prefix=add_prefix("model", prefix)
@@ -445,6 +446,7 @@ class LlamaForCausalLM(MindSporeModelBase):
             bias=False,
             prefix=add_prefix("lm_head", prefix),
         )
+        self.lm_head.construct = jit(self.lm_head.construct)
         self.tp_size = get_tensor_model_parallel_world_size()
         self.all_gather = GatherLastDim()
 
@@ -456,6 +458,8 @@ class LlamaForCausalLM(MindSporeModelBase):
             "FlashAttentionScore,PagedAttention"
         )
         os.environ["MS_DISABLE_INTERNAL_KERNELS_LIST"] = "RmsNorm"
+        if is_310p():
+            os.environ["MS_ENABLE_INTERNAL_BOOST"] = "off"
 
     def prepare_inputs(self, forward_batch, model_inputs):
         if forward_batch.capture_hidden_mode:
@@ -501,8 +505,6 @@ class LlamaForCausalLM(MindSporeModelBase):
             dtype=dtype.int32,
         )
         dyn_block_tables = Tensor(shape=[None, None], dtype=dtype.int32)
-        # dyn_intermediate_tensors = None
-        # dyn_inputs_embeds = None
         self.model.set_inputs(
             input_ids=dyn_input_ids,
             position_ids=dyn_position_ids,
@@ -550,6 +552,25 @@ class LlamaForCausalLM(MindSporeModelBase):
                         param.set_data(tensor_torch2ms(weight).move_to("Ascend"))
                     # Make sure the weight is loaded on device, so the kv cache calculation is correct.
 
+        def cast_weight_as_nz(params_dict):
+            target_keywords = [
+                "qkv_proj.weight",
+                "o_proj.weight",
+                "gate_up_proj.weight",
+                "down_proj.weight",
+                "lm_head.weight",
+            ]
+            for name, param in params_dict.items():
+                if any(name.endswith(keyword) for keyword in target_keywords):
+                    cast_weight = format_cast(param, "nz")
+                    ms.runtime.synchronize()
+                    param.set_data(cast_weight)
+
+        if is_310p():
+            ms.runtime.synchronize()
+            cast_weight_as_nz(param_dict)
+            ms.runtime.synchronize()
+
     def construct(self, **model_inputs) -> Tensor:
         q_seq_lens = model_inputs["q_seq_lens"]
         is_prefill = model_inputs["is_prefill"]
@@ -584,10 +605,12 @@ class LlamaForCausalLM(MindSporeModelBase):
                 else:
                     assert False, "Unsupported capture hidden mode"
 
-        # TODO: In pure decode scenarios, cumsum and gather operations will be redundant .
+        # TODO: In pure decode scenarios, cumsum and gather operations will be redundant.
         q_seq_lens = mint.cumsum(q_seq_lens, 0)
-        if not (forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()):
-            # In target verify mode, all tokens' logits are needed.
+        if forward_mode is None or not (
+            forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+        ):
+            # In target verify / draft extend v2 mode, all tokens' logits are needed.
             hidden_states = mint.index_select(hidden_states, 0, q_seq_lens - 1)
 
         logits = self.lm_head(hidden_states)
