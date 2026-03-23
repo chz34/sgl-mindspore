@@ -12,9 +12,10 @@ FORMAT_TYPE = {
     "nz": 29,  # TODO: need a variable or enum from mindspore to keep consistency
 }
 
+
 def is_910b():
     device = MSContext.get_instance().get_ascend_soc_version()
-    return device in ['910b', 'ascend910b']
+    return device in ["910b", "ascend910b"]
 
 
 def tensor_torch2ms(x: torch.Tensor):
@@ -89,20 +90,24 @@ def add_prefix(name: str, prefix: str) -> str:
     """
     return name if not prefix else f"{prefix}.{name}"
 
+
 def format_cast(x: ms.Tensor, format: str):
     if format in FORMAT_TYPE:
         return ms.ops.auto_generate.format_cast(x, FORMAT_TYPE[format])
     else:
         raise ValueError(f"Unknown format {format}")
 
+
 def get_ascend_soc_version():
     from mindspore._c_expression import MSContext
 
     return MSContext.get_instance().get_ascend_soc_version()
 
+
 def is_310p():
     device = get_ascend_soc_version()
     return device in ["310p", "ascend310p"]
+
 
 def patch_triton_310p():
     """
@@ -115,7 +120,7 @@ def patch_triton_310p():
     )
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 
-    AttentionBackend.support_triton = lambda x:False
+    AttentionBackend.support_triton = lambda x: False
 
     def alloc_extend(
         self,
@@ -165,34 +170,38 @@ def patch_triton_310p():
 
     NPUPagedTokenToKVPoolAllocator.alloc_extend = alloc_extend
 
+
 def patch_memory_pool_310p():
     """
     Memory-pool-npu optimization on Ascend 310P.
     """
-    import torch
     import mindspore as ms
+    import torch
     from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
+
     from sgl_mindspore.utils import is_310p
 
     def _create_buffers_nz(self):
         def create_kv_cache(kv_shape, dtype):
             if len(kv_shape) != 4:
-                raise ValueError(f"Format_Cast op need kv_cache shape be"
-                                f"(batch_size, num_heads, seq_len, head_dim),"
-                                f"but got {len(kv_shape)} dimensions: {kv_shape}")
+                raise ValueError(
+                    f"Format_Cast op need kv_cache shape be"
+                    f"(batch_size, num_heads, seq_len, head_dim),"
+                    f"but got {len(kv_shape)} dimensions: {kv_shape}"
+                )
             batch_size, num_heads, seq_len, head_dim = kv_shape
             reshaped_for_nz = (batch_size, num_heads, seq_len * head_dim)
             zeros_tensor = ms.mint.zeros(reshaped_for_nz, dtype=ms.float16)
             return ms.ops.auto_generate.format_cast(zeros_tensor, 29)
-        
+
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            kv_shape =  (
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    self.head_num,
-                    self.head_dim,
-                )
+            kv_shape = (
+                self.size // self.page_size + 1,
+                self.page_size,
+                self.head_num,
+                self.head_dim,
+            )
             self.k_buffer = [
                 create_kv_cache(kv_shape, self.store_dtype)
                 for _ in range(self.layer_num)
@@ -243,4 +252,3 @@ def patch_memory_pool_310p():
 
     NPUMHATokenToKVPool._create_buffers = _create_buffers
     NPUMHATokenToKVPool._create_buffers_nz = _create_buffers_nz
-    
