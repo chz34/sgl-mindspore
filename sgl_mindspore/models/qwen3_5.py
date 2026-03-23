@@ -61,7 +61,7 @@ def _get_layer_types(config) -> List[str]:
     )
 
 
-class GatedRMSNorm(nn.Cell):
+class RMSNormGated(nn.Cell):
     """RMSNorm followed by element-wise sigmoid gate: output = rms_norm(x) * sigmoid(gate)."""
 
     def __init__(
@@ -434,7 +434,7 @@ class Qwen3_5GatedDeltaNet(nn.Cell):
         )
 
         # Gated output normalization
-        self.norm = GatedRMSNorm(
+        self.norm = RMSNormGated(
             norm_dim=self.head_v_dim,
             eps=config.rms_norm_eps,
             param_dtype=self.param_dtype,
@@ -939,7 +939,7 @@ class GatherLastDim(nn.Cell):
         return output
 
 
-class Qwen3_5ForCausalLM(MindSporeModelBase):
+class Qwen3_5ForConditionalGeneration(MindSporeModelBase):
     def __init__(
         self,
         config,
@@ -1227,4 +1227,4 @@ class Qwen3_5ForCausalLM(MindSporeModelBase):
             ms.runtime.synchronize()
 
 
-EntryClass = Qwen3_5ForCausalLM
+EntryClass = Qwen3_5ForConditionalGeneration
