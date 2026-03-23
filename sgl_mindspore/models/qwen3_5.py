@@ -22,6 +22,7 @@ from sgl_mindspore.layers import (
     GemmaRMSNorm,
     MergedColParallelLinear,
     MLPColParallelLinear,
+    MRopePartialRotaryEmbedding,
     MsNativeAttnBackend,
     PartialRotaryEmbedding,
     QKVParallelLinear,
@@ -234,13 +235,26 @@ class Qwen3_5Attention(nn.Cell):
         )
 
         if self.partial_rope:
-            self.rotary_emb = PartialRotaryEmbedding(
-                head_size=self.head_dim,
-                rotary_dim=self.rotary_dim,
-                max_position_embeddings=self.max_position,
-                base=self.rope_theta,
-                dtype=self.param_dtype,
-            )
+            _mrope_section = None
+            if _rope_params:
+                _mrope_section = _rope_params.get("mrope_section", None)
+            if _mrope_section:
+                self.rotary_emb = MRopePartialRotaryEmbedding(
+                    head_size=self.head_dim,
+                    rotary_dim=self.rotary_dim,
+                    max_position_embeddings=self.max_position,
+                    base=self.rope_theta,
+                    dtype=self.param_dtype,
+                    mrope_section=_mrope_section,
+                )
+            else:
+                self.rotary_emb = PartialRotaryEmbedding(
+                    head_size=self.head_dim,
+                    rotary_dim=self.rotary_dim,
+                    max_position_embeddings=self.max_position,
+                    base=self.rope_theta,
+                    dtype=self.param_dtype,
+                )
         elif rope_scaling is not None and rope_scaling.get("rope_type", "") == "yarn":
             self.rotary_emb = YaRNScalingRotaryEmbedding(
                 head_size=self.head_dim,
@@ -875,8 +889,12 @@ class Qwen3_5Model(nn.Cell):
         block_tables=None,
         conv_states=None,  # [num_linear_layers, B, conv_dim_per_rank, kernel-1]
         linear_states=None,  # [num_linear_layers, B, nv_heads_per_rank, k_dim, v_dim]
+        input_embeds=None,  # [T, hidden_size] — replaces embed_tokens when provided (VLM)
     ):
-        hidden_states = self.embed_tokens(input_ids)
+        if input_embeds is not None:
+            hidden_states = input_embeds
+        else:
+            hidden_states = self.embed_tokens(input_ids)
         residual = None
 
         updated_conv_list = []
@@ -951,6 +969,8 @@ class GatherLastDim(nn.Cell):
 
 
 class Qwen3_5ForConditionalGeneration(MindSporeModelBase):
+    capture_aux_hidden_states = False
+
     def __init__(
         self,
         config,
@@ -1078,6 +1098,7 @@ class Qwen3_5ForConditionalGeneration(MindSporeModelBase):
         slot_ids: List[int] = model_inputs.pop("_slot_ids")
         conv_states: Tensor = model_inputs.pop("_conv_states")
         linear_states: Tensor = model_inputs.pop("_linear_states")
+        input_embeds: Optional[Tensor] = model_inputs.pop("input_embeds", None)
 
         q_seq_lens = model_inputs["q_seq_lens"]
         is_prefill = model_inputs["is_prefill"]
@@ -1105,6 +1126,7 @@ class Qwen3_5ForConditionalGeneration(MindSporeModelBase):
             block_tables=model_inputs["block_tables"],
             conv_states=conv_states,
             linear_states=linear_states,
+            input_embeds=input_embeds,
         )
 
         # Save updated linear attention states

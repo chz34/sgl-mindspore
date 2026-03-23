@@ -277,6 +277,153 @@ class PartialRotaryEmbedding(nn.Cell):
         return q, k
 
 
+class MRopePartialRotaryEmbedding(nn.Cell):
+    """Multimodal RoPE for Qwen3.5-VL: three position tracks (time, height, width).
+
+    positions has shape (3, T) for mrope mode, or (T,) for standard 1-D RoPE.
+
+    mrope_section: list of 3 ints giving *frequency pairs* per track.
+    If sum(mrope_section) != rotary_dim // 2, the same auto-correction used by
+    SGLang's MRotaryEmbedding is applied (scale + round + fix last).
+    """
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        dtype,
+        mrope_section: Tuple[int, int, int],
+    ) -> None:
+        super().__init__()
+        self.head_size = head_size
+        self.rotary_dim = rotary_dim
+        self.partial_rope = rotary_dim < head_size
+
+        # Auto-correct mrope_section so sum == rotary_dim // 2
+        expected = rotary_dim // 2
+        actual = sum(mrope_section)
+        if actual != expected and actual > 0:
+            scale = expected / actual
+            corrected = [max(1, int(s * scale)) for s in mrope_section]
+            deficit = expected - sum(corrected)
+            corrected[-1] += deficit
+            self.mrope_section: list = corrected
+        else:
+            self.mrope_section = list(mrope_section)
+
+        assert sum(self.mrope_section) == expected, (
+            f"mrope_section after correction {self.mrope_section} "
+            f"sums to {sum(self.mrope_section)}, expected {expected}"
+        )
+
+        self._base_rope = BaseRotaryEmbedding(
+            head_size=rotary_dim,
+            rotary_dim=rotary_dim,
+            max_position_embeddings=max_position_embeddings,
+            base=base,
+            dtype=dtype,
+        )
+        self.rotary_embedding_op = ops.ApplyRotaryPosEmb(2)
+
+    def _build_mrope_cos_sin(self, positions: Tensor) -> Tuple[Tensor, Tensor]:
+        """Build per-token [T, rotary_dim] cos/sin from 3-row mrope positions.
+
+        The base rope cache has shape [max_pos, rotary_dim] where the first
+        rotary_dim//2 columns hold the unique cos/sin values and the second
+        half is a duplicate (as produced by np.concatenate([freqs, freqs])).
+        We split the *first half* by mrope_section, gather per track, then
+        re-duplicate to restore the [half, half] layout expected by ApplyRotaryPosEmb.
+
+        positions: [3, T]
+        returns: (cos, sin) each [T, rotary_dim]
+        """
+        half = self.rotary_dim // 2
+        # Only use the non-duplicated half
+        cos_cache = self._base_rope.freqs_cos[:, :half]  # [max_pos, half]
+        sin_cache = self._base_rope.freqs_sin[:, :half]  # [max_pos, half]
+
+        cos_parts: list = []
+        sin_parts: list = []
+        d_start = 0
+        for track_idx in range(3):
+            s_i = self.mrope_section[track_idx]
+            d_end = d_start + s_i
+            pos_track = positions[track_idx]  # [T]
+            cos_parts.append(
+                mint.index_select(cos_cache[:, d_start:d_end], 0, pos_track)
+            )
+            sin_parts.append(
+                mint.index_select(sin_cache[:, d_start:d_end], 0, pos_track)
+            )
+            d_start = d_end
+
+        cos_half = mint.cat(cos_parts, dim=-1)  # [T, half]
+        sin_half = mint.cat(sin_parts, dim=-1)  # [T, half]
+        # Restore the [half, half] duplicate layout
+        cos = mint.cat([cos_half, cos_half], dim=-1)  # [T, rotary_dim]
+        sin = mint.cat([sin_half, sin_half], dim=-1)
+        return cos, sin
+
+    def construct(
+        self,
+        positions: Tensor,
+        query: Tensor,
+        key: Tensor,
+        batch_valid_length: Tensor,
+        is_prefill: bool,
+        offsets=None,
+    ) -> Tuple[Tensor, Tensor]:
+        T_q = query.shape[0]
+        T_k = key.shape[0]
+
+        if positions.ndim == 2:
+            # mrope mode: always build per-token cos/sin from the 3 position tracks
+            cos, sin = self._build_mrope_cos_sin(positions)
+        else:
+            # Standard 1-D positions — fall back to base rope indexing
+            if is_prefill:
+                cos = self._base_rope.freqs_cos
+                sin = self._base_rope.freqs_sin
+            else:
+                cos = mint.index_select(
+                    self._base_rope.freqs_cos, 0, positions.view(-1)
+                )
+                sin = mint.index_select(
+                    self._base_rope.freqs_sin, 0, positions.view(-1)
+                )
+
+        if self.partial_rope:
+            # Apply RoPE only to the first rotary_dim dims of each head
+            num_heads_q = query.shape[-1] // self.head_size
+            num_heads_k = key.shape[-1] // self.head_size
+            q = query.reshape(T_q, num_heads_q, self.head_size)
+            k = key.reshape(T_k, num_heads_k, self.head_size)
+            q_rot = q[..., : self.rotary_dim].reshape(
+                T_q, num_heads_q * self.rotary_dim
+            )
+            q_pass = q[..., self.rotary_dim :]
+            k_rot = k[..., : self.rotary_dim].reshape(
+                T_k, num_heads_k * self.rotary_dim
+            )
+            k_pass = k[..., self.rotary_dim :]
+            q_rot, k_rot = self.rotary_embedding_op(
+                q_rot, k_rot, cos, sin, batch_valid_length
+            )
+            q_rot = q_rot.reshape(T_q, num_heads_q, self.rotary_dim)
+            k_rot = k_rot.reshape(T_k, num_heads_k, self.rotary_dim)
+            q = mint.cat([q_rot, q_pass], dim=-1).reshape(
+                T_q, num_heads_q * self.head_size
+            )
+            k = mint.cat([k_rot, k_pass], dim=-1).reshape(
+                T_k, num_heads_k * self.head_size
+            )
+            return q, k
+        else:
+            return self.rotary_embedding_op(query, key, cos, sin, batch_valid_length)
+
+
 class DeepseekScalingRotaryEmbedding(BaseRotaryEmbedding):
     def __init__(
         self,

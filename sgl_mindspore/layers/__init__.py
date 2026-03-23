@@ -16,6 +16,7 @@ from sgl_mindspore.layers.norm import GemmaRMSNorm, RMSNorm
 from sgl_mindspore.layers.rope import (
     BaseRotaryEmbedding,
     DeepseekScalingRotaryEmbedding,
+    MRopePartialRotaryEmbedding,
     PartialRotaryEmbedding,
     YaRNScalingRotaryEmbedding,
     yarn_get_mscale,
