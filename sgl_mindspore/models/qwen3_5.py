@@ -151,17 +151,28 @@ class Qwen3_5Attention(nn.Cell):
             config, "head_dim", config.hidden_size // self.total_num_heads
         )
         self.scaling = float(self.head_dim**-0.5)
-        self.rope_theta = int(config.rope_theta)
+        # rope_theta and partial_rotary_factor may be nested inside rope_parameters
+        _rope_params = getattr(config, "rope_parameters", None)
+        if _rope_params:
+            self.rope_theta = int(_rope_params.get("rope_theta", config.rope_theta))
+            partial_rotary_factor = float(
+                _rope_params.get(
+                    "partial_rotary_factor",
+                    getattr(config, "partial_rotary_factor", 1.0),
+                )
+            )
+        else:
+            self.rope_theta = int(config.rope_theta)
+            partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         self.param_dtype = config.param_dtype
         self.max_position = config.max_position_embeddings
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
 
         # Partial RoPE
-        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         self.rotary_dim = int(self.head_dim * partial_rotary_factor)
         self.partial_rope = self.rotary_dim < self.head_dim
 
-        rope_scaling = config.rope_scaling if config.rope_scaling else None
+        rope_scaling = getattr(config, "rope_scaling", None) or None
         if rope_scaling and not ("rope_type" in rope_scaling or "type" in rope_scaling):
             rope_scaling = None
 
@@ -948,7 +959,12 @@ class Qwen3_5ForConditionalGeneration(MindSporeModelBase):
     ) -> None:
         super().__init__()
         self.prev_prefill = False
-        self.config = config
+        # Qwen3_5Config is a wrapper: model params live in text_config.
+        # SGLang injects `dtype` on the parent; copy it over so text_config has it.
+        text_config = getattr(config, "text_config", config)
+        if not hasattr(text_config, "dtype"):
+            text_config.dtype = getattr(config, "dtype", None)
+        self.config = text_config
         quant_config = get_ms_quant_config(quant_config)
 
         if self.config.dtype:
