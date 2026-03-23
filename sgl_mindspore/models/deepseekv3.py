@@ -8,9 +8,9 @@ from typing import Iterable, List, Optional, Tuple
 import mindspore.common.dtype as mstype
 import torch
 from mindspore import Parameter, Tensor, dtype, jit, mint, mutable, nn, ops
-from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.distributed.utils import divide
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 
@@ -849,5 +849,6 @@ class DeepseekV3ForCausalLM(MindSporeModelBase):
             num_logical_experts=config.n_routed_experts,
             num_groups=config.n_group,
         )
+
 
 EntryClass = DeepseekV3ForCausalLM

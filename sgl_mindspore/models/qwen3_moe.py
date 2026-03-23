@@ -4,7 +4,7 @@ import logging
 import math
 import os
 from functools import lru_cache
-from typing import Iterable, Optional, Tuple, Type, Union, Any
+from typing import Any, Iterable, Optional, Tuple, Type, Union
 
 import mindspore as ms
 import mindspore.common.dtype as mstype
@@ -19,8 +19,8 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.distributed.utils import divide
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 from sgl_mindspore.layers import (
@@ -38,7 +38,13 @@ from sgl_mindspore.layers import (
     YaRNScalingRotaryEmbedding,
 )
 from sgl_mindspore.models.mindspore_model_base import MindSporeModelBase
-from sgl_mindspore.utils import _get_tp_group_name, tensor_torch2ms, get_ms_dtype, format_cast, is_310p
+from sgl_mindspore.utils import (
+    _get_tp_group_name,
+    format_cast,
+    get_ms_dtype,
+    is_310p,
+    tensor_torch2ms,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -562,9 +568,14 @@ class Qwen3MoeForCausalLM(MindSporeModelBase):
 
         for name, weight in weights:
             if is_310p():
-                weight = (weight.to(torch.float16) if
-                    (str(weight.dtype) == "torch.float32" or str(
-                        weight.dtype) == "torch.bfloat16") else weight)
+                weight = (
+                    weight.to(torch.float16)
+                    if (
+                        str(weight.dtype) == "torch.float32"
+                        or str(weight.dtype) == "torch.bfloat16"
+                    )
+                    else weight
+                )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
