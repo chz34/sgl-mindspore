@@ -177,7 +177,7 @@ class QKVParallelLinear(ColParallelLinear):
             param.set_data(tensor_torch2ms(weight))
             return None
 
-        output_dim = getattr(param, "output_dim", None)
+        output_dim = getattr(param, "output_dim", 0)
         tp_rank = self.tp_rank
 
         shard_offset, shard_size = self.get_shard_offset_and_size(shard_id=shard_id)
