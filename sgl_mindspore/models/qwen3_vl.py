@@ -703,6 +703,23 @@ class Qwen3VLMoeVisionModel(nn.Cell):
 # ---------------------------------------------------------------------------
 # SGLang architecture registration
 # ---------------------------------------------------------------------------
+# SGLang's registry keys classes by __name__.  "import X as Y" does NOT change
+# __name__, so the alias would still register as the original name.  Create a
+# true subclass so __name__ == "Qwen3VLForConditionalGeneration", matching the
+# architectures field used in HuggingFace Qwen3-VL configs.
+from sgl_mindspore.models.qwen3_5 import Qwen3_5ForConditionalGeneration  # noqa: E402
+
+
+class Qwen3VLForConditionalGeneration(Qwen3_5ForConditionalGeneration):
+    """Thin subclass registered under the HuggingFace architecture name."""
+
+
+EntryClass = Qwen3VLForConditionalGeneration
+
+
+# ---------------------------------------------------------------------------
+# SGLang architecture registration
+# ---------------------------------------------------------------------------
 # HuggingFace Qwen3-VL configs set architectures=["Qwen3VLForConditionalGeneration"].
 # The full VL model lives in qwen3_5.py (co-located with the text-only model per
 # CLAUDE.md conventions).  Create an alias here so SGLang's model registry maps the
