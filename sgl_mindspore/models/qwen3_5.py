@@ -1573,10 +1573,32 @@ class Qwen3_5ForConditionalGeneration(MindSporeModelBase):
     # Weight loading
     # ------------------------------------------------------------------
 
+    def _load_param(
+        self,
+        param_dict: dict,
+        name: str,
+        weight: torch.Tensor,
+        shard_id=None,
+    ) -> None:
+        """Load a single weight tensor into param_dict[name], handling TP sharding."""
+        if name not in param_dict:
+            return
+        param = param_dict[name]
+        if hasattr(param, "weight_load"):
+            (
+                param.weight_load(param, weight, shard_id)
+                if shard_id is not None
+                else param.weight_load(param, weight)
+            )
+            param.set_data(param.move_to("Ascend"))
+        else:
+            param.set_data(tensor_torch2ms(weight).move_to("Ascend"))
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights for the full model (vision encoder + language model) in MindSpore."""
         param_dict = self.parameters_dict()
 
+        # LM-only stacked projections (visual weights skip this via "continue")
         stacked_params_mapping = [
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
@@ -1586,114 +1608,95 @@ class Qwen3_5ForConditionalGeneration(MindSporeModelBase):
         ]
 
         for name, weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-
-            if "visual" in name:
-                # Strip "model." prefix so the key matches param_dict (e.g., "visual.xxx")
-                if name.startswith("model.visual."):
-                    name = name[len("model.") :]
-                # Checkpoint uses "attn.qkv." but our module uses "attn.qkv_proj."
-                name = name.replace("attn.qkv.", "attn.qkv_proj.")
-                # Reshape Conv3d patch_embed weight to linear
-                if name == "visual.patch_embed.proj.weight" and weight.dim() == 5:
-                    out_c, in_c, t, h, w = weight.shape
-                    weight = weight.reshape(out_c, in_c * t * h * w)
-                if name in param_dict:
-                    param = param_dict[name]
-                    if hasattr(param, "weight_load"):
-                        if name.endswith(
-                            ("attn.qkv_proj.weight", "attn.qkv_proj.bias")
-                        ):
-                            # Fused QKV: split into q/k/v and load separately.
-                            # weight_load is a bound method of the QKVParallelLinear cell.
-                            cell = param.weight_load.__self__
-                            hd = cell.head_dim
-                            nh = cell.total_num_heads
-                            nkv = cell.total_num_kv_head
-                            q_sz, kv_sz = nh * hd, nkv * hd
-                            for sid, chunk in [
-                                ("q", weight[:q_sz]),
-                                ("k", weight[q_sz : q_sz + kv_sz]),
-                                ("v", weight[q_sz + kv_sz :]),
-                            ]:
-                                param.weight_load(param, chunk, sid)
-                        else:
-                            param.weight_load(param, weight)
-                        param.set_data(param.move_to("Ascend"))
-                    else:
-                        param.set_data(tensor_torch2ms(weight).move_to("Ascend"))
-                continue
-
-            if "mtp" in name:
+            if "rotary_emb.inv_freq" in name or "mtp" in name:
                 continue
 
             if "language_model" in name:
                 name = name.replace("model.language_model.", "model.")
 
+            # linear_attn.conv1d.weight: custom TP sharding across [key, key, value]
             if "linear_attn.conv1d.weight" in name:
                 if weight.dim() == 3:
                     weight = weight.squeeze(1)
                 nk = self.config.linear_num_key_heads
-                head_k = self.config.linear_key_head_dim
                 nv = self.config.linear_num_value_heads
-                head_v = self.config.linear_value_head_dim
+                hk = self.config.linear_key_head_dim
+                hv = self.config.linear_value_head_dim
                 tp = get_attention_tp_size()
                 rank = get_attention_tp_rank()
-                key_dim = nk * head_k
-                value_dim = nv * head_v
-                sections = [key_dim, key_dim, value_dim]
+                sections = [nk * hk, nk * hk, nv * hv]
                 out_rows = sum(s // tp for s in sections)
                 sharded = np.zeros(
                     [out_rows, weight.shape[1]], dtype=self._param_dtype_np
                 )
-                param_offset = 0
-                w_offset = 0
+                p_off = w_off = 0
                 for s in sections:
                     shard = s // tp
-                    w_shard = weight.narrow(
-                        0, w_offset + rank * shard, shard
-                    ).contiguous()
-                    sharded[param_offset : param_offset + shard] = (
-                        w_shard.float().numpy()
+                    sharded[p_off : p_off + shard] = (
+                        weight.narrow(0, w_off + rank * shard, shard)
+                        .contiguous()
+                        .float()
+                        .numpy()
                     )
-                    w_offset += s
-                    param_offset += shard
-                ms_weight = Tensor(sharded, dtype=self.config.param_dtype)
-                lookup_name = name.replace("conv1d.weight", "conv1d_weight")
-                if lookup_name in param_dict:
-                    param_dict[lookup_name].set_data(ms_weight.to("Ascend"))
+                    w_off += s
+                    p_off += shard
+                lookup = name.replace("conv1d.weight", "conv1d_weight")
+                if lookup in param_dict:
+                    param_dict[lookup].set_data(
+                        Tensor(sharded, dtype=self.config.param_dtype).to("Ascend")
+                    )
                 continue
 
+            # linear_attn scalars: shard along dim 0
             if "linear_attn.A_log" in name or "linear_attn.dt_bias" in name:
                 tp = get_attention_tp_size()
                 rank = get_attention_tp_rank()
-                shard_size = weight.shape[0] // tp
-                w_shard = weight.narrow(0, rank * shard_size, shard_size).contiguous()
+                shard = weight.shape[0] // tp
+                w_shard = weight.narrow(0, rank * shard, shard).contiguous()
                 if name in param_dict:
                     param_dict[name].set_data(
                         tensor_torch2ms(w_shard.float()).to("Ascend")
                     )
                 continue
 
+            # stacked_params_mapping applies to LM weights only; visual skips it
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
+                if weight_name not in name or "visual" in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 if name in param_dict:
                     param = param_dict[name]
-                    assert hasattr(param, "weight_load")
                     param.weight_load(param, weight, shard_id)
                     param.set_data(param.move_to("Ascend"))
                 break
             else:
-                if name in param_dict:
-                    param = param_dict[name]
-                    if hasattr(param, "weight_load"):
-                        param.weight_load(param, weight)
-                        param.set_data(param.move_to("Ascend"))
-                    else:
-                        param.set_data(tensor_torch2ms(weight).move_to("Ascend"))
+                # Visual weight normalisation (mirrors SGLang's approach)
+                if "visual" in name:
+                    if name.startswith("model.visual."):
+                        name = name[len("model.") :]
+                    # Checkpoint stores fused "attn.qkv."; module uses "attn.qkv_proj."
+                    name = name.replace("attn.qkv.", "attn.qkv_proj.")
+                    # Conv3d patch_embed weight → flatten to linear [out, in*T*H*W]
+                    if name == "visual.patch_embed.proj.weight" and weight.dim() == 5:
+                        out_c, in_c, t, h, w = weight.shape
+                        weight = weight.reshape(out_c, in_c * t * h * w)
+                    # QKVParallelLinear requires per-shard calls; split fused QKV here
+                    if name.endswith(("attn.qkv_proj.weight", "attn.qkv_proj.bias")):
+                        if name in param_dict:
+                            param = param_dict[name]
+                            cell = param.weight_load.__self__
+                            q_sz = cell.total_num_heads * cell.head_dim
+                            kv_sz = cell.total_num_kv_head * cell.head_dim
+                            for sid, chunk in [
+                                ("q", weight[:q_sz]),
+                                ("k", weight[q_sz : q_sz + kv_sz]),
+                                ("v", weight[q_sz + kv_sz :]),
+                            ]:
+                                param.weight_load(param, chunk, sid)
+                            param.set_data(param.move_to("Ascend"))
+                        continue
+
+                self._load_param(param_dict, name, weight)
 
         def cast_weight_as_nz(params_dict):
             target_keywords = [
