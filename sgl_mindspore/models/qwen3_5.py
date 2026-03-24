@@ -1602,7 +1602,24 @@ class Qwen3_5ForConditionalGeneration(MindSporeModelBase):
                 if name in param_dict:
                     param = param_dict[name]
                     if hasattr(param, "weight_load"):
-                        param.weight_load(param, weight)
+                        if name.endswith(
+                            ("attn.qkv_proj.weight", "attn.qkv_proj.bias")
+                        ):
+                            # Fused QKV: split into q/k/v and load separately.
+                            # weight_load is a bound method of the QKVParallelLinear cell.
+                            cell = param.weight_load.__self__
+                            hd = cell.head_dim
+                            nh = cell.total_num_heads
+                            nkv = cell.total_num_kv_head
+                            q_sz, kv_sz = nh * hd, nkv * hd
+                            for sid, chunk in [
+                                ("q", weight[:q_sz]),
+                                ("k", weight[q_sz : q_sz + kv_sz]),
+                                ("v", weight[q_sz + kv_sz :]),
+                            ]:
+                                param.weight_load(param, chunk, sid)
+                        else:
+                            param.weight_load(param, weight)
                         param.set_data(param.move_to("Ascend"))
                     else:
                         param.set_data(tensor_torch2ms(weight).move_to("Ascend"))
