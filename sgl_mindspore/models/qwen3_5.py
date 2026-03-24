@@ -1274,10 +1274,6 @@ class Qwen3_5ForCausalLM(MindSporeModelBase):
             ms.runtime.synchronize()
 
 
-_DEFAULT_IMAGE_TOKEN_ID = 151655
-_DEFAULT_VIDEO_TOKEN_ID = 151656
-
-
 class Qwen3_5ForConditionalGeneration(Qwen3_5ForCausalLM):
     """Qwen3.5-VL: pure MindSpore vision encoder + language decoder.
 
@@ -1353,15 +1349,31 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5ForCausalLM):
         self,
         visual_features: Tensor,
         input_ids: Tensor,
+        mm_inputs,
     ) -> Tensor:
-        """Scatter visual features into text embeddings at image/video token positions."""
-        text_embeds = self.model.embed_tokens(input_ids)
+        """Scatter visual features into text embeddings at multimodal token positions.
 
-        image_token_id = getattr(self.config, "image_token_id", _DEFAULT_IMAGE_TOKEN_ID)
-        video_token_id = getattr(self.config, "video_token_id", _DEFAULT_VIDEO_TOKEN_ID)
-        visual_mask = (input_ids == ms.Tensor(image_token_id, dtype=ms.int32)) | (
-            input_ids == ms.Tensor(video_token_id, dtype=ms.int32)
-        )
+        After pad_input_ids(), each image/video token has been replaced with a unique
+        pad_value (= MM_PAD_SHIFT_VALUE + hash, ~1_000_000+N) that is beyond the vocab
+        range.  We must:
+          1. Build the visual mask from pad_values, not from image_token_id.
+          2. Clamp input_ids before calling embed_tokens so hash values don't cause an
+             out-of-range lookup.
+        """
+        # 1. Build visual mask: positions whose id is any mm item's pad_value.
+        visual_mask = mint.zeros(input_ids.shape, dtype=ms.bool_)
+        for mm_input in mm_inputs or []:
+            if mm_input is None:
+                continue
+            for item in mm_input.mm_items:
+                visual_mask = visual_mask | (input_ids == item.pad_value)
+
+        # 2. Clamp input_ids to valid vocab range, then get text embeddings.
+        vocab_size = self.model.embed_tokens.num_embeddings
+        clamped_ids = mint.clamp(input_ids, min=0, max=vocab_size - 1)
+        text_embeds = self.model.embed_tokens(clamped_ids)
+
+        # 3. Scatter visual features into the text embedding tensor.
         visual_positions = visual_mask.nonzero()
         if visual_positions.shape[0] == 0:
             return text_embeds
@@ -1384,7 +1396,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5ForCausalLM):
             visual_features = self._run_vision_encoder(forward_batch)
             if visual_features is not None:
                 model_inputs["input_embeds"] = self._inject_visual_features(
-                    visual_features, model_inputs["input_ids"]
+                    visual_features,
+                    model_inputs["input_ids"],
+                    forward_batch.mm_inputs,
                 )
                 forward_batch.mm_inputs = None
         return model_inputs

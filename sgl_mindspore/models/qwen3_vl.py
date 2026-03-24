@@ -698,3 +698,17 @@ class Qwen3VLMoeVisionModel(nn.Cell):
         # 6. Final merger: [total_merged_tokens, out_hidden_size]
         x = self.merger(x)
         return x
+
+
+# ---------------------------------------------------------------------------
+# SGLang architecture registration
+# ---------------------------------------------------------------------------
+# HuggingFace Qwen3-VL configs set architectures=["Qwen3VLForConditionalGeneration"].
+# The full VL model lives in qwen3_5.py (co-located with the text-only model per
+# CLAUDE.md conventions).  Create an alias here so SGLang's model registry maps the
+# architecture name to our implementation without duplicating code.
+from sgl_mindspore.models.qwen3_5 import (  # noqa: E402
+    Qwen3_5ForConditionalGeneration as Qwen3VLForConditionalGeneration,
+)
+
+EntryClass = Qwen3VLForConditionalGeneration
