@@ -63,7 +63,10 @@ def _get_layer_types(config) -> List[str]:
 
 
 class RMSNormGated(nn.Cell):
-    """RMSNorm followed by element-wise sigmoid gate: output = rms_norm(x) * sigmoid(gate)."""
+    """RMSNorm with SiLU gate: output = rms_norm(x) * silu(gate).
+
+    Matches SGLang's fla/layernorm_gated.py with norm_before_gate=True.
+    """
 
     def __init__(
         self, norm_dim: int, eps: float, param_dtype, prefix: str = ""
@@ -76,7 +79,7 @@ class RMSNormGated(nn.Cell):
         orig = x.shape
         x_flat = x.reshape(-1, orig[-1])
         out = rms_norm(x=x_flat.float(), gamma=self.weight.float(), epsilon=self.eps)[0]
-        out = out.to(x.dtype) * mint.sigmoid(gate.reshape(-1, orig[-1]))
+        out = out.to(x.dtype) * mint.nn.functional.silu(gate.reshape(-1, orig[-1]))
         return out.reshape(orig)
 
 
@@ -489,7 +492,7 @@ class Qwen3_5GatedDeltaNet(nn.Cell):
     ) -> Tuple[Tensor, Tensor]:
         """Single-step GatedDeltaNet state update. Returns (output, new_S)."""
         # Normalize key
-        k_norm = ops.L2Normalize(axis=-1, epsilon=1e-6)(k)
+        k_norm = ops.L2Normalize(axis=-1, epsilon=1e-6)(k.float()).to(k.dtype)
         # Retrieved value from current state
         retrieved = mint.matmul(k_norm.unsqueeze(1), S).squeeze(
             1
@@ -619,7 +622,7 @@ class Qwen3_5GatedDeltaNet(nn.Cell):
         decay = mint.exp(dt * A.unsqueeze(0))  # [B, nv_heads]
 
         # Normalize keys
-        k_norm = ops.L2Normalize(axis=-1, epsilon=1e-6)(k)
+        k_norm = ops.L2Normalize(axis=-1, epsilon=1e-6)(k.float()).to(k.dtype)
 
         # Delta rule: batched
         # linear_state: [B, nv_heads, head_k_dim, head_v_dim]
