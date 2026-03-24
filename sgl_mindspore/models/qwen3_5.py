@@ -1270,10 +1270,10 @@ _DEFAULT_VIDEO_TOKEN_ID = 151656
 
 
 class Qwen3_5ForConditionalGeneration(MindSporeModelBase):
-    """Qwen3.5-VL: PyTorch vision encoder + MindSpore language decoder.
+    """Qwen3.5-VL: pure MindSpore vision encoder + language decoder.
 
-    The vision encoder (Qwen3VLMoeVisionModel from SGLang) runs via torch_npu.
-    The language model (Qwen3_5Model) runs in MindSpore.
+    Both the vision encoder (Qwen3VLMoeVisionModel) and the language model
+    (Qwen3_5Model) run entirely in MindSpore on Ascend NPU.
     """
 
     capture_aux_hidden_states = False
@@ -1305,27 +1305,20 @@ class Qwen3_5ForConditionalGeneration(MindSporeModelBase):
             )
         setattr(self.config, "param_dtype", param_dtype)
 
-        # ---- Vision encoder (PyTorch / torch_npu) ----
-        # Store as a plain Python attribute so MindSpore's Cell machinery
-        # doesn't attempt to iterate over PyTorch parameters.
+        # ---- Vision encoder (MindSpore) ----
         vision_config = getattr(self.config, "vision_config", None)
         if vision_config is not None:
-            try:
-                from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
+            from sgl_mindspore.models.qwen3_vl import Qwen3VLMoeVisionModel
 
-                _vision_model = Qwen3VLMoeVisionModel(
-                    vision_config,
-                    quant_config=None,
-                    norm_eps=getattr(self.config, "rms_norm_eps", 1e-6),
-                    prefix="visual",
-                )
-                # Bypass MindSpore's __setattr__ to avoid mis-classification
-                object.__setattr__(self, "visual", _vision_model)
-            except Exception as exc:
-                logger.warning("Failed to create vision encoder: %s", exc)
-                object.__setattr__(self, "visual", None)
+            self.visual = Qwen3VLMoeVisionModel(
+                vision_config,
+                param_dtype=param_dtype,
+                norm_eps=getattr(self.config, "rms_norm_eps", 1e-6),
+                quant_config=quant_config,
+                prefix=add_prefix("visual", prefix),
+            )
         else:
-            object.__setattr__(self, "visual", None)
+            self.visual = None
 
         # ---- MindSpore language model ----
         self.model = Qwen3_5Model(
@@ -1408,10 +1401,8 @@ class Qwen3_5ForConditionalGeneration(MindSporeModelBase):
     # Vision helpers
     # ------------------------------------------------------------------
 
-    def _run_vision_encoder(
-        self, forward_batch: ForwardBatch
-    ) -> Optional[torch.Tensor]:
-        """Extract and encode visual features from forward_batch using the PyTorch encoder."""
+    def _run_vision_encoder(self, forward_batch: ForwardBatch) -> Optional[Tensor]:
+        """Extract and encode visual features from forward_batch using the MindSpore encoder."""
         if self.visual is None:
             return None
 
@@ -1437,11 +1428,10 @@ class Qwen3_5ForConditionalGeneration(MindSporeModelBase):
             image_grid_thw = torch.cat(
                 [item.image_grid_thw for item in image_items], dim=0
             )
-            pixel_values = pixel_values.to(
-                device=self.visual.device, dtype=self.visual.dtype
+            img_features = self.visual(
+                tensor_torch2ms(pixel_values).to(self.config.param_dtype),
+                tensor_torch2ms(image_grid_thw),
             )
-            with torch.no_grad():
-                img_features = self.visual(pixel_values, grid_thw=image_grid_thw)
             visual_features_list.append(img_features)
             for item in image_items:
                 if isinstance(item.feature, torch.Tensor):
@@ -1452,11 +1442,10 @@ class Qwen3_5ForConditionalGeneration(MindSporeModelBase):
             video_grid_thw = torch.cat(
                 [item.video_grid_thw for item in video_items], dim=0
             )
-            pixel_values = pixel_values.to(
-                device=self.visual.device, dtype=self.visual.dtype
+            vid_features = self.visual(
+                tensor_torch2ms(pixel_values).to(self.config.param_dtype),
+                tensor_torch2ms(video_grid_thw),
             )
-            with torch.no_grad():
-                vid_features = self.visual(pixel_values, grid_thw=video_grid_thw)
             visual_features_list.append(vid_features)
             for item in video_items:
                 if isinstance(item.feature, torch.Tensor):
@@ -1465,11 +1454,11 @@ class Qwen3_5ForConditionalGeneration(MindSporeModelBase):
         if not visual_features_list:
             return None
 
-        return torch.cat(visual_features_list, dim=0)
+        return mint.cat(visual_features_list, dim=0)
 
     def _inject_visual_features(
         self,
-        visual_features: torch.Tensor,
+        visual_features: Tensor,
         input_ids: Tensor,  # MS tensor [T], int32
     ) -> Tensor:
         """Merge visual features into text embeddings at image-token positions."""
@@ -1488,11 +1477,10 @@ class Qwen3_5ForConditionalGeneration(MindSporeModelBase):
         if visual_positions.shape[0] == 0:
             return text_embeds
 
-        visual_features_ms = tensor_torch2ms(visual_features).to(text_embeds.dtype)
         text_embeds = ops.tensor_scatter_update(
             text_embeds,
             visual_positions,
-            visual_features_ms,
+            visual_features.to(text_embeds.dtype),
         )
         return text_embeds
 
@@ -1586,10 +1574,8 @@ class Qwen3_5ForConditionalGeneration(MindSporeModelBase):
     # ------------------------------------------------------------------
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        """Load weights for both the vision encoder (PyTorch) and language model (MindSpore)."""
-        from sglang.srt.model_loader.weight_utils import default_weight_loader
-
-        param_dict = self.parameters_dict()  # MindSpore params only
+        """Load weights for the full model (vision encoder + language model) in MindSpore."""
+        param_dict = self.parameters_dict()
 
         stacked_params_mapping = [
             (".qkv_proj", ".q_proj", "q"),
@@ -1599,20 +1585,27 @@ class Qwen3_5ForConditionalGeneration(MindSporeModelBase):
             (".gate_up_proj", ".up_proj", "up"),
         ]
 
-        visual_weights: Dict[str, torch.Tensor] = {}
-
         for name, weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
 
             if "visual" in name:
-                local_name = name
-                for prefix_str in ("model.visual.", "visual."):
-                    if local_name.startswith(prefix_str):
-                        local_name = local_name[len(prefix_str) :]
-                        break
-                local_name = local_name.replace("attn.qkv.", "attn.qkv_proj.")
-                visual_weights[local_name] = weight
+                # Strip "model." prefix so the key matches param_dict (e.g., "visual.xxx")
+                if name.startswith("model.visual."):
+                    name = name[len("model.") :]
+                # Checkpoint uses "attn.qkv." but our module uses "attn.qkv_proj."
+                name = name.replace("attn.qkv.", "attn.qkv_proj.")
+                # Reshape Conv3d patch_embed weight to linear
+                if name == "visual.patch_embed.proj.weight" and weight.dim() == 5:
+                    out_c, in_c, t, h, w = weight.shape
+                    weight = weight.reshape(out_c, in_c * t * h * w)
+                if name in param_dict:
+                    param = param_dict[name]
+                    if hasattr(param, "weight_load"):
+                        param.weight_load(param, weight)
+                        param.set_data(param.move_to("Ascend"))
+                    else:
+                        param.set_data(tensor_torch2ms(weight).move_to("Ascend"))
                 continue
 
             if "mtp" in name:
@@ -1684,23 +1677,6 @@ class Qwen3_5ForConditionalGeneration(MindSporeModelBase):
                         param.set_data(param.move_to("Ascend"))
                     else:
                         param.set_data(tensor_torch2ms(weight).move_to("Ascend"))
-
-        if visual_weights and self.visual is not None:
-            vision_params = dict(self.visual.named_parameters(remove_duplicate=False))
-            loaded, skipped = 0, 0
-            for local_name, weight in visual_weights.items():
-                if local_name in vision_params:
-                    param = vision_params[local_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, weight.to(dtype=param.dtype))
-                    loaded += 1
-                else:
-                    skipped += 1
-            logger.info(
-                "Vision encoder: loaded %d weights, skipped %d", loaded, skipped
-            )
 
         def cast_weight_as_nz(params_dict):
             target_keywords = [
