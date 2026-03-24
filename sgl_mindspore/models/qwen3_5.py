@@ -1450,4 +1450,4 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5ForCausalLM):
         super().load_weights(weights)
 
 
-EntryClass = [Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration]
+EntryClass = Qwen3_5ForCausalLM
