@@ -490,18 +490,25 @@ class Qwen3_5GatedDeltaNet(nn.Cell):
         decay: Tensor,  # [nv_heads]
         beta: Tensor,  # [nv_heads]
     ) -> Tuple[Tensor, Tensor]:
-        """Single-step GatedDeltaNet state update. Returns (output, new_S)."""
-        # Normalize key
+        """Single-step GatedDeltaNet state update. Returns (output, new_S).
+
+        Matches HuggingFace's torch_recurrent_gated_delta_rule: decay is applied
+        to S first, and retrieval uses the already-decayed state.
+          new_S = decay*S + beta * outer(k, v - k @ (decay*S))
+        """
         k_norm = ops.L2Normalize(axis=-1, epsilon=1e-6)(k.float()).to(k.dtype)
-        # Retrieved value from current state
-        retrieved = mint.matmul(k_norm.unsqueeze(1), S).squeeze(
+        # 1. Apply decay to the whole state first
+        new_S = decay[:, None, None] * S  # [nv_heads, head_k_dim, head_v_dim]
+        # 2. Retrieve from the decayed state
+        retrieved = mint.matmul(k_norm.unsqueeze(1), new_S).squeeze(
             1
         )  # [nv_heads, head_v_dim]
         delta_v = v - retrieved
         outer = mint.matmul(
             k_norm.unsqueeze(2), delta_v.unsqueeze(1)
         )  # [nv_heads, head_k_dim, head_v_dim]
-        new_S = decay[:, None, None] * S + beta[:, None, None] * outer
+        # 3. Write delta into the decayed state
+        new_S = new_S + beta[:, None, None] * outer
         o = mint.matmul(q.unsqueeze(1), new_S).squeeze(1)  # [nv_heads, head_v_dim]
         return o, new_S
 
@@ -625,18 +632,21 @@ class Qwen3_5GatedDeltaNet(nn.Cell):
         k_norm = ops.L2Normalize(axis=-1, epsilon=1e-6)(k.float()).to(k.dtype)
 
         # Delta rule: batched
+        # Matches HuggingFace's recurrent: decay S first, retrieve from decayed state.
+        #   new_S = decay*S + beta * outer(k, v - k @ (decay*S))
         # linear_state: [B, nv_heads, head_k_dim, head_v_dim]
-        # k_norm: [B, nv_heads, head_k_dim]
-        retrieved = mint.matmul(k_norm.unsqueeze(2), linear_state).squeeze(
+        # 1. Decay the whole state
+        new_linear_state = decay[:, :, None, None] * linear_state
+        # 2. Retrieve from the decayed state
+        retrieved = mint.matmul(k_norm.unsqueeze(2), new_linear_state).squeeze(
             2
         )  # [B, nv_heads, head_v_dim]
         delta_v = v - retrieved
         outer = mint.matmul(
             k_norm.unsqueeze(3), delta_v.unsqueeze(2)
         )  # [B, nv_heads, head_k_dim, head_v_dim]
-        new_linear_state = (
-            decay[:, :, None, None] * linear_state + beta[:, :, None, None] * outer
-        )
+        # 3. Write delta into the decayed state
+        new_linear_state = new_linear_state + beta[:, :, None, None] * outer
 
         o = mint.matmul(q.unsqueeze(2), new_linear_state).squeeze(
             2
